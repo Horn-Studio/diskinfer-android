@@ -1,0 +1,90 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# diskinfer [question]
+# diskinfer -m /path/model.gguf [--arena MiB] [question] [engine args]
+
+# make sure the termux tools are reachable even from a bare shell
+export PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH
+
+H=/data/data/com.termux/files/home
+L=$H/llm
+RUN=/data/local/tmp/llm/run_as_root.sh
+M=""
+ARGS=()
+HAS_ARENA=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) M="$2"; shift 2 ;;
+    -h|--help)
+      cat <<'USAGE'
+usage: diskinfer [question]
+       diskinfer -m /path/to/model.gguf [--arena MiB] [question] [engine args]
+
+  --arena MiB    weight arena size, 128..2048, clamped to free RAM.
+                 default = MemTotal/8 (at least 176).
+                 bigger = fewer disk re-reads. if it can hold the whole model the
+                 run becomes as fast as a normal in-RAM inference.
+  -n N           max tokens to generate (default 256, capped by ctx)
+  -c N           context size (default 256)
+  -ub N          prefill batch (default 4; 1 = least RAM, slowest prefill)
+  -t N           threads (default 4, try 8 on a phone)
+  --temp F       sampling temperature (default 1.0)
+  --top-k N      default 20
+  --top-p F      default 0.95
+  --raw          raw completion prompt (default)
+  --chat         use the chat template with thinking off
+  --sys "text"   system message for --chat
+
+model search order:
+  /storage/emulated/0/models/*.gguf
+  $HOME/models/*.gguf
+  /data/local/tmp/llm/*.gguf
+USAGE
+      exit 0 ;;
+    -l|--list)
+      ls -la /storage/emulated/0/models/*.gguf 2>/dev/null
+      ls -la "$H"/models/*.gguf 2>/dev/null
+      exit 0 ;;
+    --arena) HAS_ARENA=1; ARGS+=("$1" "$2"); shift 2 ;;
+    --arena=*) HAS_ARENA=1; ARGS+=("$1"); shift ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [ -z "$M" ]; then
+  for d in /storage/emulated/0/models "$H/models" /data/local/tmp/llm; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.gguf; do
+      [ -f "$f" ] && M="$f" && break
+    done
+    [ -n "$M" ] && break
+  done
+fi
+
+if [ -z "$M" ] || [ ! -f "$M" ]; then
+  echo "no .gguf model found (looked in /storage/emulated/0/models, ~/models, /data/local/tmp/llm)"
+  exit 1
+fi
+
+# default arena: an eighth of the installed RAM, at least 176 MiB (one whole tensor)
+if [ "$HAS_ARENA" = "0" ]; then
+  tot_kb=""
+  while read -r key val _; do
+    if [ "${key%:}" = "MemTotal" ]; then tot_kb="$val"; break; fi
+  done < /proc/meminfo
+  if [ -n "$tot_kb" ]; then
+    a=$(( tot_kb / 1024 / 8 ))
+    [ "$a" -lt 176 ] && a=176
+    [ "$a" -gt 2048 ] && a=2048
+    ARGS=("--arena" "$a" "${ARGS[@]}")
+  fi
+fi
+
+# root gives us oom protection and a stable cpu governor; fall back to plain user if not
+if [ -x "$RUN" ] && su -c true >/dev/null 2>&1; then
+  QUOTED=$(printf '%q ' "${ARGS[@]}" 2>/dev/null)
+  exec su -c "\"$RUN\" \"$M\" $QUOTED"
+fi
+
+echo "diskinfer: no root, running as the termux user"
+export LLAMA_DISK_LOG=$H/diskinfer.log
+exec "$L/disktui" -m "$M" "${ARGS[@]}"

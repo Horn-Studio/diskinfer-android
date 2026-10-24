@@ -1,0 +1,14 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# termfont <8..20>   termux terminal font size (smaller = more columns)
+F=/data/data/com.termux/shared_prefs/com.termux_preferences.xml
+if [ -z "$1" ]; then
+  echo "current: $(grep -o 'fontsize">[0-9]*' "$F" 2>/dev/null | cut -d'>' -f2)"
+  echo "usage: termfont 8..20"
+  exit 0
+fi
+printf "%s\n" "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>" "<map>" "    <int name=\"log_level\" value=\"1\" />" "    <string name=\"fontsize\">$1</string>" "</map>" > "$F"
+chmod 660 "$F" 2>/dev/null
+echo "font size set to $1, restarting termux ..."
+am force-stop com.termux
+sleep 1
+am start -n com.termux/.app.TermuxActivity > /dev/null 2>&1
