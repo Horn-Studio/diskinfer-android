@@ -1,0 +1,8 @@
+﻿baseline : ggml-org/llama.cpp master, downloaded 2026-10-24
+           (zip snapshot, roughly commit 8e5a58df87ab59dfceb5b961ae26691e39f30c24)
+toolchain: Android NDK r27c, static, -DBUILD_SHARED_LIBS=OFF -static
+           armv7 needs -mfpu=neon-vfpv4 -mfloat-abi=softfp and -D_FILE_OFFSET_BITS=64
+mtune    : arm64: default (-O3); armv7: -march=armv7-a -mfpu=neon-vfpv4
+
+llama.cpp 的接口变动很快，patch 用 git apply -3 / patch -p1 --fuzz=3 可能有偏移，
+对不上就看 src/PATCHES.md 手工改（一共 6 个文件、~230 行）。
