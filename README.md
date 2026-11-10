@@ -1,13 +1,13 @@
 # diskinfer Android（1.0.1）
 
-## 更新内容
+## 1.0.1 新内容（含 2026-11-09 需求批）
 
-### Android 功能
+### 功能：MoE 优化、新 TUI、`/v1` API、安装器、多语言
 
 - **磁盘流式推理**：权重不 mmap、不整体读入内存，按计算图节点 `pread` 进固定大小 arena，用完按 LRU 换出；
   arena 能装下整个模型时，第一个 token 之后就没有 IO。
   arena 由 `LLAMA_DISK_STREAM_MB` 控制，TUI 设置页里也能改。
-- **MoE 快速推理**：`MUL_MAT_ID` 节点只读取 router 选中的专家切片，其余专家权重不读盘；
+- **MoE 快速推理（优化 + 修复）**：`MUL_MAT_ID` 节点只读取 router 选中的专家切片，其余专家权重不读盘（专家级流式，不再整张量换入）；
   设置页 `MoE 快速路径` 开关或 `LLAMA_DISK_MOE=1`（默认关）。
   实测 Qwen3.5-0.8B-MoE（28 experts / top-12）`nodes=762 experts=10668 fallbacks=0`，
   贪心 token 与整张量加载逐 token 一致。
@@ -33,14 +33,17 @@
   `--lang` 或 `DISKINFER_LANG` 可覆盖。
 - **上游基线**：fork 升级到 llama.cpp **v0.9.0（`cd959bae`）**，版本号 `0.9.0-dev`。
 
-### 1.0.1 变化
+> 下面这批功能（MoE 快速推理优化、新 TUI、`/v1` API、安装器自适应、多语言、上游 v0.9.0）
+> 以及「修复的 bug」里的全部条目，都属于 **1.0.1** 的内容。
+
+### 1.0.1 自身变化
 
 - 标题栏版本显示 **`diskinfer 1.0.1`**（原 `v5`）。
 - **不再默认 "Hello" 自动推理**：提示词默认为空，进入运行页时光标直接在 Prompt 区，由用户自己输入。
 - 设置页新增 **内存池 (MB)**；运行页底部按键说明改为显式的 `s=… c=… q=… i=…`。
 - 包内不再附带 README（更新/使用说明单独发布）。
 
-## 修复的 bug
+## 修复的 bug（同样是 1.0.1 的内容）
 
 1. **安装布局 bug（网上反馈）**：旧 `install.sh` 把 `device/` 推成 `/data/local/tmp/llm/device/…`，
    而启动器/脚本按扁平路径找 → 装完命令不可用。现在包与安装器全部扁平布局（`setup.sh` 同时兼容
