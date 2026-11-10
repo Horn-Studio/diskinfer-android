@@ -1,0 +1,20 @@
+# build outputs (per-abi cmake trees live in build/build-<abi>)
+build/build-*/
+build/out/
+dist/
+*.zip
+*.tar.gz
+
+# local scratch / rollback area created when the windows part was split out
+_windows-archive/
+
+# python (tests/tools)
+__pycache__/
+*.pyc
+
+# pulled device logs
+test/logs/
+
+# editor / os noise
+.DS_Store
+Thumbs.db

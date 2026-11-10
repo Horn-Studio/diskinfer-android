@@ -1,74 +1,75 @@
-// disktui: single turn chat UI for the disk streaming build
+// disktui: settings page + run page TUI for the disk streaming build
 //
-// layout: the upper part of the terminal is a scrolling log, the last three rows are
-//         Q / A / status. every generated token reports when its disk read finished and
-//         when its compute finished.
+// the same binary serves an OpenAI compatible, no-auth API on port 4000:
+//
+//   disktui -m model.gguf              interactive TUI (model picker, settings, run page)
+//   disktui -m model.gguf --api-only   headless API server (no TTY needed)
+//   disktui --help                     usage
+//
+// pages:
+//   model picker   -> models found in $DISKINFER_MODEL_DIRS, ~/models, /sdcard/models
+//   settings page  -> context length, temperature, chat template, MoE, API switch
+//   run page       -> prompt editor, prefill/generation progress, streaming answer, log
+//
+// the engine (engine.cpp) does the llama work and exposes a live_state the run
+// page polls; the API (api.cpp) shares the same engine and the same single
+// inference slot, so TUI and API can never decode at the same time.
 
-#include "llama.h"
-#include "ggml-cpu.h"
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
+#include "engine.h"
+#include "api.h"
+#include "i18n.h"
+
 #include "llama-disk.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
-#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
-#include <sys/time.h>
+#include <termios.h>
 #include <unistd.h>
-#endif
-
-// ---------------------------------------------------------------- terminal
-
-static int T_ROWS = 18;
-static int T_COLS = 46;
-static int LOG_ROWS = 15;
-static std::deque<std::string> g_log;
-static std::recursive_mutex g_paint_mtx;
-
-static std::string g_q;       // current question
-static std::string g_a;       // answer so far
-static std::string g_status;  // bottom status line
-
-static long rss_kb() {
-#if defined(_WIN32)
-    return -1;
 #else
-    FILE * f = fopen("/proc/self/statm", "r");
-    if (!f) return -1;
-    long size = 0, resident = 0;
-    if (fscanf(f, "%ld %ld", &size, &resident) != 2) { fclose(f); return -1; }
-    fclose(f);
-    return resident * (sysconf(_SC_PAGESIZE) / 1024);
+#include <conio.h>
+#include <io.h>
+#include <windows.h>
 #endif
-}
 
-static void term_size() {
-#if defined(_WIN32)
-    return;
-#else
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
-        T_ROWS = ws.ws_row;
-        T_COLS = ws.ws_col;
-    }
-#endif
-    LOG_ROWS = std::max(4, T_ROWS - 3);
-}
+namespace fs = std::filesystem;
 
-// ---- utf-8 aware text handling: never cut a code point in half and measure real columns
-static int utf8_decode(const std::string & s, size_t i, uint32_t * cp) {
+
+
+
+namespace {
+
+// ===========================================================================
+// text: utf-8 aware width / clip / wrap
+// ===========================================================================
+
+int utf8_decode(const std::string & s, size_t i, uint32_t * cp) {
     const unsigned char c = (unsigned char) s[i];
     if (c < 0x80) { *cp = c; return 1; }
 
@@ -89,27 +90,27 @@ static int utf8_decode(const std::string & s, size_t i, uint32_t * cp) {
     return n + 1;
 }
 
-// terminal cells a code point occupies
-static int cp_width(uint32_t cp) {
-    if (cp < 32 || (cp >= 0x7F && cp < 0xA0)) return 0;               // control
-    if (cp >= 0x0300 && cp <= 0x036F) return 0;                        // combining
+int cp_width(uint32_t cp) {
+    if (cp < 32 || (cp >= 0x7F && cp < 0xA0)) return 0;
+    if (cp >= 0x0300 && cp <= 0x036F) return 0;
     if (cp == 0x200B || (cp >= 0x200C && cp <= 0x200F)) return 0;
-    if ((cp >= 0x1100 && cp <= 0x115F) ||                              // hangul jamo
-        (cp >= 0x2E80 && cp <= 0xA4CF) ||                              // cjk, kana
-        (cp >= 0xAC00 && cp <= 0xD7A3) ||                              // hangul
-        (cp >= 0xF900 && cp <= 0xFAFF) ||                              // cjk compat
-        (cp >= 0xFE30 && cp <= 0xFE6F) ||                              // cjk forms
-        (cp >= 0xFF00 && cp <= 0xFF60) ||                              // fullwidth
+    if (cp == 0xFE0F) return 0;
+    if ((cp >= 0x1100 && cp <= 0x115F) ||
+        (cp >= 0x2E80 && cp <= 0xA4CF) ||
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) ||
+        (cp >= 0xFE30 && cp <= 0xFE6F) ||
+        (cp >= 0xFF00 && cp <= 0xFF60) ||
         (cp >= 0xFFE0 && cp <= 0xFFE6) ||
-        (cp >= 0x1F300 && cp <= 0x1F9FF)) {                            // emoji
+        (cp >= 0x1F300 && cp <= 0x1F9FF)) {
         return 2;
     }
     return 1;
 }
 
-static int disp_width(const std::string & s) {
+int disp_width(const std::string & s) {
     int w = 0;
-    for (size_t i = 0; i < s.size(); ) {
+    for (size_t i = 0; i < s.size();) {
         uint32_t cp = 0;
         i += utf8_decode(s, i, &cp);
         w += cp_width(cp);
@@ -117,33 +118,29 @@ static int disp_width(const std::string & s) {
     return w;
 }
 
-// cut to at most n display columns, keep the tail if keep_tail
-static std::string clip(const std::string & s, int n, bool keep_tail) {
+std::string clip(const std::string & s, int n, bool keep_tail = false) {
     if (n <= 0) {
         return "";
     }
     if (disp_width(s) <= n) {
         return s;
     }
-
     if (!keep_tail) {
         std::string out;
         int w = 0;
-        for (size_t i = 0; i < s.size(); ) {
+        for (size_t i = 0; i < s.size();) {
             uint32_t cp = 0;
             const int len = utf8_decode(s, i, &cp);
             const int cw = cp_width(cp);
             if (w + cw > n) {
                 break;
             }
-            out.append(s, i, len);
+            out.append(s, i, (size_t) len);
             w += cw;
-            i += len;
+            i += (size_t) len;
         }
         return out;
     }
-
-    // keep the tail: walk backwards, then trim to a code point boundary
     size_t start = s.size();
     int w = 0;
     while (start > 0) {
@@ -163,22 +160,11 @@ static std::string clip(const std::string & s, int n, bool keep_tail) {
     return s.substr(start);
 }
 
-static void out(const char * fmt, ...) {
-    char buf[4096];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    fputs(buf, stdout);
-}
-
-// paint one line padded to the terminal width so leftovers disappear
-// drop control characters, turn tabs into spaces and replace invalid utf-8 bytes,
-// so a garbage token cannot move the cursor or print broken glyphs
-static std::string sanitize(const std::string & s) {
+// drop control characters, turn tabs into spaces, repair invalid utf-8 bytes
+std::string sanitize(const std::string & s) {
     std::string out;
     out.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ) {
+    for (size_t i = 0; i < s.size();) {
         const unsigned char c = (unsigned char) s[i];
         if (c == '\t') {
             out += "    ";
@@ -197,189 +183,461 @@ static std::string sanitize(const std::string & s) {
         uint32_t cp = 0;
         const int len = utf8_decode(s, i, &cp);
         if (len == 1) {
-            out += '?';   // invalid lead or truncated sequence
+            out += '?';
             ++i;
         } else {
-            out.append(s, i, len);
-            i += len;
+            out.append(s, i, (size_t) len);
+            i += (size_t) len;
         }
     }
     return out;
 }
 
-static void paint_row(int row, const std::string & text) {
-    out("\x1b[%d;1H\x1b[2K%s", row, clip(sanitize(text), T_COLS, false).c_str());
+std::string pad_to(const std::string & s, int w) {
+    const int d = w - disp_width(s);
+    return d > 0 ? s + std::string((size_t) d, ' ') : s;
 }
 
-static void paint_all() {
-    std::lock_guard<std::recursive_mutex> lk(g_paint_mtx);
-
-    const int n_line  = (int) g_log.size();
-    const int i_start = n_line > LOG_ROWS ? n_line - LOG_ROWS : 0;
-    for (int i = 0; i < LOG_ROWS; ++i) {
-        const int idx = i_start + i;
-        paint_row(1 + i, idx < n_line ? g_log[idx] : std::string());
+std::string pad_between(const std::string & left, const std::string & right, int total) {
+    const int gap = total - disp_width(left) - disp_width(right);
+    if (gap <= 0) {
+        return clip(left, total, false);
     }
-
-    paint_row(LOG_ROWS + 1, "Q: " + clip(g_q, T_COLS - 3, false));
-    paint_row(LOG_ROWS + 2, "A: " + clip(g_a, T_COLS - 3, true));
-    paint_row(LOG_ROWS + 3, clip(g_status, T_COLS, false));
-
-    fflush(stdout);
+    return left + std::string((size_t) gap, ' ') + right;
 }
 
-// add a log line, wrapping it to the terminal width
-static void logf(const char * fmt, ...) {
-    char buf[2048];
+std::vector<std::string> wrap_text(const std::string & text, int width) {
+    std::vector<std::string> out;
+    if (width <= 1) {
+        width = 2;
+    }
+    std::string cur;
+    int cur_w = 0;
+    for (size_t i = 0; i < text.size();) {
+        uint32_t cp = 0;
+        const int len = utf8_decode(text, i, &cp);
+        if (cp == '\n') {
+            out.push_back(cur);
+            cur.clear();
+            cur_w = 0;
+            i += (size_t) len;
+            continue;
+        }
+        if (cp == '\r') {
+            i += (size_t) len;
+            continue;
+        }
+        const int cw = cp_width(cp);
+        if (cur_w + cw > width && !cur.empty()) {
+            out.push_back(cur);
+            cur.clear();
+            cur_w = 0;
+        }
+        cur.append(text, i, (size_t) len);
+        cur_w += cw;
+        i += (size_t) len;
+    }
+    out.push_back(cur);
+    return out;
+}
+
+// ===========================================================================
+// terminal
+// ===========================================================================
+
+int  g_rows = 24;
+int  g_cols = 80;
+bool g_compact = false;    // contract: rows < 20 || cols < 60 => compact layout
+bool g_narrow  = false;    // cols < 60: no side-by-side hint columns
+bool g_short   = false;    // rows < 20: drop sections to keep the essentials
+
+enum style_t {
+    S_NORM = 0, S_BOLD, S_DIM, S_CYAN, S_CYAN_BOLD, S_SEL, S_RED, S_GREEN, S_YELLOW, S_BAR,
+};
+
+const char * sgr(style_t s) {
+    switch (s) {
+        case S_BOLD:      return "\x1b[1m";
+        case S_DIM:       return "\x1b[2m";
+        case S_CYAN:      return "\x1b[36m";
+        case S_CYAN_BOLD: return "\x1b[1;36m";
+        case S_SEL:       return "\x1b[1;33m";
+        case S_RED:       return "\x1b[1;31m";
+        case S_GREEN:     return "\x1b[32m";
+        case S_YELLOW:    return "\x1b[33m";
+        case S_BAR:       return "\x1b[7m";
+        default:          return "";
+    }
+}
+
+struct row {
+    std::string text;
+    style_t     style = S_NORM;
+};
+
+std::mutex       g_paint_mtx;
+std::vector<row> g_prev_frame;
+bool             g_term_active = false;
+
+#if defined(_WIN32)
+HANDLE g_hout = INVALID_HANDLE_VALUE;
+HANDLE g_hin  = INVALID_HANDLE_VALUE;
+DWORD  g_old_mode = 0;
+DWORD  g_old_in_mode = 0;
+bool   g_mode_saved = false;
+bool   g_in_mode_saved = false;
+UINT   g_old_out_cp = 0;
+UINT   g_old_in_cp = 0;
+#else
+struct termios g_old_termios;
+bool           g_termios_saved = false;
+#endif
+
+void out(const char * fmt, ...) {
+    char buf[8192];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    fputs(buf, stdout);
+}
 
-    std::lock_guard<std::recursive_mutex> lk(g_paint_mtx);
-
-    std::string s(buf);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
-        s.pop_back();
-    }
-
-    const int width = std::max(8, T_COLS - 1);
-
-    // wrap on code point boundaries and real column width
-    std::string cur;
-    int cur_w = 0;
-    for (size_t i = 0; i < s.size(); ) {
-        uint32_t cp = 0;
-        const int len = utf8_decode(s, i, &cp);
-        const int cw  = cp_width(cp);
-        if (cur_w + cw > width && !cur.empty()) {
-            g_log.push_back(cur);
-            cur.clear();
-            cur_w = 0;
-        }
-        cur.append(s, i, len);
-        cur_w += cw;
-        i += len;
-    }
-    if (!cur.empty() || s.empty()) {
-        g_log.push_back(cur);
-    }
-    while ((int) g_log.size() > LOG_ROWS) {
-        g_log.pop_front();
-    }
-
-    static FILE * g_logfile = nullptr;
-    static bool g_logfile_tried = false;
-    if (!g_logfile_tried) {
-        g_logfile_tried = true;
-        const char * lp = getenv("LLAMA_DISK_LOG");
-        if (lp != nullptr) {
-            g_logfile = fopen(lp, "w");
-        }
-        if (g_logfile == nullptr) {
-            const char * home = getenv("HOME");
-            if (home != nullptr) {
-                const std::string p = std::string(home) + "/diskinfer.log";
-                g_logfile = fopen(p.c_str(), "w");
+void term_size() {
+#if defined(_WIN32)
+    if (g_hout != INVALID_HANDLE_VALUE && g_hout != NULL) {
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        if (GetConsoleScreenBufferInfo(g_hout, &csbi)) {
+            const int rows = csbi.srWindow.Bottom - csbi.srWindow.Top + 1;
+            const int cols = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+            if (rows > 0 && cols > 0) {
+                g_rows = rows;
+                g_cols = cols;
             }
         }
     }
-    if (g_logfile != nullptr) {
-        fputs(s.c_str(), g_logfile);
-        fputc('\n', g_logfile);
-        fflush(g_logfile);
+#else
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0) {
+        g_rows = ws.ws_row;
+        g_cols = ws.ws_col;
     }
+#endif
+    g_compact = (g_rows < 20 || g_cols < 60);
+    g_narrow  = (g_cols < 60);
+    g_short   = (g_rows < 20);
 }
 
-static void set_status(const std::string & s) {
-    std::lock_guard<std::recursive_mutex> lk(g_paint_mtx);
-    g_status = s;
-}
+void term_enter() {
+#if defined(_WIN32)
+    g_old_out_cp = GetConsoleOutputCP();
+    g_old_in_cp  = GetConsoleCP();
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
 
-static int64_t now_ms();
-
-// ---- live progress, painted by a helper thread while a decode is running
-static std::atomic<bool> g_busy{false};
-static std::atomic<bool> g_quit{false};
-static std::atomic<int>  g_live_cur{0};
-static std::atomic<int>  g_live_tot{0};
-static std::mutex        g_live_mtx;
-static char              g_live_piece[64] = {0};
-static const char *      g_live_phase = "pp";
-static int64_t           g_live_t0 = 0;
-static unsigned long long g_live_io0 = 0;
-
-static void paint_status_only() {
-    std::lock_guard<std::recursive_mutex> lk(g_paint_mtx);
-    paint_row(LOG_ROWS + 3, clip(g_status, T_COLS, false));
+    g_hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (g_hout != INVALID_HANDLE_VALUE && g_hout != NULL) {
+        DWORD mode = 0;
+        if (GetConsoleMode(g_hout, &mode)) {
+            g_old_mode = mode;
+            g_mode_saved = true;
+            SetConsoleMode(g_hout, mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+    g_hin = GetStdHandle(STD_INPUT_HANDLE);
+    if (g_hin != INVALID_HANDLE_VALUE && g_hin != NULL) {
+        DWORD mode = 0;
+        if (GetConsoleMode(g_hin, &mode)) {
+            g_old_in_mode = mode;
+            g_in_mode_saved = true;
+            SetConsoleMode(g_hin, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
+        }
+    }
+#else
+    if (tcgetattr(STDIN_FILENO, &g_old_termios) == 0) {
+        g_termios_saved = true;
+        struct termios t = g_old_termios;
+        t.c_lflag &= ~(ICANON | ECHO | IEXTEN);
+        t.c_iflag &= ~(IXON | ICRNL | INPCK | ISTRIP);
+        t.c_oflag &= ~(OPOST);
+        t.c_cc[VMIN]  = 0;
+        t.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &t);
+    }
+#endif
+    out("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
     fflush(stdout);
+    g_term_active = true;
+    term_size();
 }
 
-static void live_begin(const char * phase, int cur, int tot, const char * piece) {
-    llama_disk::llama_disk_stats s;
-    llama_disk::get_stats(&s);
-
-    {
-        std::lock_guard<std::mutex> lk(g_live_mtx);
-        snprintf(g_live_piece, sizeof(g_live_piece), "%s", piece);
+void term_leave() {
+    if (!g_term_active) {
+        return;
     }
-    g_live_phase = phase;
-    g_live_cur   = cur;
-    g_live_tot   = tot;
-    g_live_io0   = s.io_us;
-    g_live_t0    = now_ms();
-    g_busy       = true;
-}
-
-static void live_end() {
-    g_busy = false;
-}
-
-static std::thread * g_painter = nullptr;
-
-static void tui_exit(int code) {
-    g_quit = true;
-    if (g_painter != nullptr && g_painter->joinable()) {
-        g_painter->join();
+#if defined(_WIN32)
+    DWORD n = 0;
+    if (g_hout != INVALID_HANDLE_VALUE && g_hout != NULL) {
+        WriteFile(g_hout, "\x1b[?25h\x1b[?1049l", 17, &n, NULL);
     }
+    if (g_in_mode_saved) { SetConsoleMode(g_hin, g_old_in_mode); }
+    if (g_mode_saved)    { SetConsoleMode(g_hout, g_old_mode); }
+    if (g_old_out_cp != 0) { SetConsoleOutputCP(g_old_out_cp); }
+    if (g_old_in_cp != 0)  { SetConsoleCP(g_old_in_cp); }
+#else
     out("\x1b[?25h\x1b[?1049l");
     fflush(stdout);
-    exit(code);
+    if (g_termios_saved) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_old_termios);
+    }
+#endif
+    g_term_active = false;
 }
 
-static void painter_main() {
-    while (!g_quit) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        if (!g_busy) {
-            continue;
-        }
-
-        llama_disk::llama_disk_stats s;
-        llama_disk::get_stats(&s);
-
-        const double el  = (now_ms() - g_live_t0) / 1000.0;
-        const double io  = (s.io_us - g_live_io0) / 1e6;
-        const double cmp = el - io;
-
-        char piece[64];
-        {
-            std::lock_guard<std::mutex> lk(g_live_mtx);
-            snprintf(piece, sizeof(piece), "%s", g_live_piece);
-        }
-
-        char buf[190];
-        snprintf(buf, sizeof(buf), "%s %d/%d '%s' L%02d io %.1f/%.1fs ld%llu now %llu cmp %.1fs",
-                 g_live_phase, g_live_cur.load(), g_live_tot.load(), piece,
-                 s.layer + 1, io, s.io_us / 1e6, s.loads,
-                 s.clock_us / 1000000, cmp);
-
-        set_status(buf);
-        paint_status_only();
+void invalidate() {
+    std::lock_guard<std::mutex> lk(g_paint_mtx);
+    g_prev_frame.clear();
+    if (g_term_active) {
+        out("\x1b[2J\x1b[H");
+        fflush(stdout);
     }
 }
 
-// route the llama.cpp log into the log area, drop the noisy ones
-static void llama_log_cb(enum ggml_log_level level, const char * text, void * /*ud*/) {
+void paint_frame(const std::vector<row> & rows) {
+    std::lock_guard<std::mutex> lk(g_paint_mtx);
+
+    std::string buf;
+    const int n = (int) rows.size();
+
+    for (int i = 0; i < n; ++i) {
+        const std::string text = clip(sanitize(rows[(size_t) i].text), g_cols, false);
+        if (i < (int) g_prev_frame.size() &&
+            g_prev_frame[(size_t) i].text == text &&
+            g_prev_frame[(size_t) i].style == rows[(size_t) i].style) {
+            continue;
+        }
+        char pos[32];
+        snprintf(pos, sizeof(pos), "\x1b[%d;1H", i + 1);
+        buf += pos;
+        buf += sgr(rows[(size_t) i].style);
+        buf += text;
+        buf += "\x1b[0m\x1b[K";
+    }
+    for (int i = n; i < (int) g_prev_frame.size(); ++i) {
+        char pos[32];
+        snprintf(pos, sizeof(pos), "\x1b[%d;1H\x1b[K", i + 1);
+        buf += pos;
+    }
+
+    g_prev_frame.clear();
+    g_prev_frame.reserve(rows.size());
+    for (const auto & r : rows) {
+        g_prev_frame.push_back(row{ clip(sanitize(r.text), g_cols, false), r.style });
+    }
+
+    if (!buf.empty()) {
+        fwrite(buf.data(), 1, buf.size(), stdout);
+        fflush(stdout);
+    }
+}
+
+// ---- key input -------------------------------------------------------------
+
+enum {
+    K_NONE = -1,
+    K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_ENTER, K_ESC, K_BACKSPACE, K_TAB,
+    K_PGUP, K_PGDN, K_HOME, K_END, K_DEL,
+};
+
+#if !defined(_WIN32)
+
+bool read_byte(char & c, int timeout_ms) {
+    struct pollfd pfd;
+    pfd.fd      = STDIN_FILENO;
+    pfd.events  = POLLIN;
+    pfd.revents = 0;
+    const int r = poll(&pfd, 1, timeout_ms);
+    if (r <= 0) {
+        return false;
+    }
+    return read(STDIN_FILENO, &c, 1) == 1;
+}
+
+int read_key(int timeout_ms) {
+    char c = 0;
+    if (!read_byte(c, timeout_ms)) {
+        return K_NONE;
+    }
+    if (c == '\x1b') {
+        char a = 0;
+        if (!read_byte(a, 25)) {
+            return K_ESC;
+        }
+        if (a == '[' || a == 'O') {
+            char b = 0;
+            if (!read_byte(b, 25)) {
+                return K_ESC;
+            }
+            switch (b) {
+                case 'A': return K_UP;
+                case 'B': return K_DOWN;
+                case 'C': return K_RIGHT;
+                case 'D': return K_LEFT;
+                case 'H': return K_HOME;
+                case 'F': return K_END;
+                case 'Z': return K_TAB;
+                case '3': { char t = 0; read_byte(t, 10); return K_DEL; }
+                case '5': { char t = 0; read_byte(t, 10); return K_PGUP; }
+                case '6': { char t = 0; read_byte(t, 10); return K_PGDN; }
+                default:  return K_NONE;
+            }
+        }
+        return K_ESC;
+    }
+    if (c == '\r' || c == '\n') return K_ENTER;
+    if (c == 127 || c == 8)     return K_BACKSPACE;
+    if (c == '\t')              return K_TAB;
+    if (c == 3)                 return K_ESC;
+    return (unsigned char) c;
+}
+
+#else
+
+bool win_kbhit(int timeout_ms) {
+    const DWORD t0 = GetTickCount();
+    for (;;) {
+        if (_kbhit()) {
+            return true;
+        }
+        if ((int) (GetTickCount() - t0) >= timeout_ms) {
+            return false;
+        }
+        Sleep(10);
+    }
+}
+
+int read_key(int timeout_ms) {
+    if (!win_kbhit(timeout_ms)) {
+        return K_NONE;
+    }
+    const int c = _getch();
+    if (c == 0 || c == 224) {
+        const int e = _getch();
+        switch (e) {
+            case 72: return K_UP;
+            case 80: return K_DOWN;
+            case 75: return K_LEFT;
+            case 77: return K_RIGHT;
+            case 71: return K_HOME;
+            case 79: return K_END;
+            case 73: return K_PGUP;
+            case 81: return K_PGDN;
+            case 83: return K_DEL;
+            default: return K_NONE;
+        }
+    }
+    if (c == '\r') return K_ENTER;
+    if (c == '\b') return K_BACKSPACE;
+    if (c == 27)   return K_ESC;
+    if (c == 3)    return K_ESC;
+    return c;
+}
+
+#endif
+
+// ---- platform helpers ------------------------------------------------------
+
+#if defined(_WIN32)
+UINT g_saved_out_cp = 0;
+UINT g_saved_in_cp  = 0;
+
+// the strings are UTF-8; on Windows the console has to be told so, otherwise
+// cmd/powershell shows mojibake. every step is non-fatal when redirected.
+void win_console_enter() {
+    g_saved_out_cp = GetConsoleOutputCP();
+    g_saved_in_cp  = GetConsoleCP();
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+}
+
+void win_console_leave() {
+    if (g_saved_out_cp != 0) { SetConsoleOutputCP(g_saved_out_cp); }
+    if (g_saved_in_cp != 0)  { SetConsoleCP(g_saved_in_cp); }
+}
+#endif
+
+// stdin and stdout must both be real terminals for the interactive TUI
+bool tty_available() {
+#if defined(_WIN32)
+    return _isatty(_fileno(stdin)) != 0 && _isatty(_fileno(stdout)) != 0;
+#else
+    return isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0;
+#endif
+}
+
+// ---- signals ---------------------------------------------------------------
+
+// the console control handler runs on a separate thread, the POSIX signal
+// handler must only touch a sig_atomic_t; both are plain volatile integers here
+#if defined(_WIN32)
+volatile LONG g_signal = 0;
+#else
+volatile sig_atomic_t g_signal = 0;
+#endif
+
+#if defined(_WIN32)
+BOOL WINAPI console_ctrl_handler(DWORD /*type*/) {
+    g_signal = 1;
+    return TRUE;
+}
+#else
+void posix_signal_handler(int sig) {
+    g_signal = sig;
+}
+#endif
+
+void install_signal_handlers() {
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+#else
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = posix_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP,  &sa, nullptr);
+#endif
+}
+
+// ===========================================================================
+// log routing
+// ===========================================================================
+
+std::mutex              g_log_mtx;
+std::atomic<bool>       g_cancel_in_progress{ false };
+std::deque<std::string> g_logbuf;
+bool                    g_headless = false;
+const size_t            g_log_max = 500;
+
+void route_log(const std::string & line) {
+    if (line.empty()) {
+        return;
+    }
+    if (g_headless) {
+        fputs(line.c_str(), stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_log_mtx);
+    g_logbuf.push_back(line);
+    while (g_logbuf.size() > g_log_max) {
+        g_logbuf.pop_front();
+    }
+}
+
+void llama_log_cb(enum ggml_log_level level, const char * text, void * /*ud*/) {
     if (text == nullptr) {
         return;
     }
@@ -390,431 +648,1681 @@ static void llama_log_cb(enum ggml_log_level level, const char * text, void * /*
     if (s.empty()) {
         return;
     }
-
-    // skip the per layer kv/recurrent device dumps and the metadata key/value dump
-    if (s.find("llama_kv_cache: layer") != std::string::npos ||
-        s.find("llama_memory_recurrent, layer") != std::string::npos ||
-        s.find("llama_memory_recurrent: layer") != std::string::npos ||
-        s.find("is used by node") != std::string::npos ||
-        s.find("create_tensor: loading tensor") != std::string::npos) {
-        return;
-    }
-
+    // keep the log readable: errors and the disk engine status are useful, the
+    // loader / graph dump chatter is not
     if (level == GGML_LOG_LEVEL_ERROR) {
-        s = "! " + s;
-    }
-
-    logf("%s", s.c_str());
-}
-
-static void disk_msg_cb(const char * text) {
-    if (text == nullptr) {
+        // an abort callback makes llama_decode return an error; that is the user
+        // cancelling, not a real failure, so keep the log clean
+        if (g_cancel_in_progress.load()) {
+            return;
+        }
+        route_log("! " + s);
         return;
     }
-    logf("%s", text);
+    if (s.rfind("llama-disk:", 0) == 0 || s.find("warning:") != std::string::npos ||
+        s.rfind("[load]", 0) == 0 || s.rfind("[api]", 0) == 0) {
+        route_log(s);
+    }
 }
 
-// ---------------------------------------------------------------- engine
+void disk_msg_cb(const char * text) {
+    if (text != nullptr) {
+        route_log(text);
+    }
+}
 
-static int64_t now_ms() {
+std::vector<std::string> log_tail(int max_lines, int width) {
+    std::vector<std::string> wrapped;
+    {
+        std::lock_guard<std::mutex> lk(g_log_mtx);
+        for (const auto & line : g_logbuf) {
+            for (auto & w : wrap_text(line, width)) {
+                wrapped.push_back(std::move(w));
+            }
+        }
+    }
+    if (max_lines <= 0) {
+        return {};
+    }
+    if ((int) wrapped.size() <= max_lines) {
+        return wrapped;
+    }
+    return std::vector<std::string>(wrapped.end() - max_lines, wrapped.end());
+}
+
+// ===========================================================================
+// model discovery
+// ===========================================================================
+
+struct model_entry {
+    std::string        path;
+    std::string        name;
+    unsigned long long size = 0;
+};
+
+std::string home_dir() {
+    const char * home = getenv("HOME");
+    if (home != nullptr && home[0] != '\0') {
+        return home;
+    }
 #if defined(_WIN32)
-    return 0;
+    const char * up = getenv("USERPROFILE");
+    if (up != nullptr && up[0] != '\0') {
+        return up;
+    }
+#endif
+    return std::string();
+}
+
+std::vector<std::string> split_dirs(const std::string & s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        const bool sep = (c == ':') ||
+#if defined(_WIN32)
+                         (c == ';') ||
+#endif
+                         false;
+        if (sep) {
+            if (!cur.empty()) {
+                out.push_back(cur);
+                cur.clear();
+            }
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) {
+        out.push_back(cur);
+    }
+    return out;
+}
+
+std::vector<std::string> model_dirs() {
+    std::vector<std::string> dirs;
+
+    const char * env = getenv("DISKINFER_MODEL_DIRS");
+    if (env != nullptr && env[0] != '\0') {
+        for (auto & d : split_dirs(env)) {
+            dirs.push_back(d);
+        }
+    }
+    const std::string home = home_dir();
+    if (!home.empty()) {
+        dirs.push_back(home + "/models");
+    }
+    dirs.push_back("/storage/emulated/0/models");
+    dirs.push_back("/data/local/tmp/llm/models");
+    dirs.push_back("/data/local/tmp/llm");
+
+    std::vector<std::string> out;
+    for (const auto & d : dirs) {
+        bool dup = false;
+        for (const auto & e : out) {
+            if (e == d) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        std::error_code ec;
+        if (fs::is_directory(d, ec)) {
+            out.push_back(d);
+        }
+    }
+    return out;
+}
+
+std::vector<model_entry> scan_models() {
+    std::vector<model_entry> out;
+    std::vector<std::string> seen_paths;    // canonical paths already listed
+    std::vector<std::string> seen_files;    // "name|size" fallback for odd filesystems
+    for (const auto & dir : model_dirs()) {
+        std::error_code ec;
+        fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+        if (ec) {
+            continue;
+        }
+        for (const auto & de : it) {
+            std::error_code ec2;
+            if (!de.is_regular_file(ec2) || ec2) {
+                continue;
+            }
+            std::string ext = de.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return (char) std::tolower(c); });
+            if (ext != ".gguf") {
+                continue;
+            }
+            // the same file can be reachable through several model dirs (symlinks,
+            // bind mounts); list it once
+            std::error_code ec3;
+            const fs::path canon = fs::canonical(de.path(), ec3);
+            const std::string key = ec3 ? fs::absolute(de.path(), ec3).string() : canon.string();
+            bool dup = false;
+            for (const auto & s : seen_paths) {
+                if (s == key) { dup = true; break; }
+            }
+            if (dup) {
+                continue;
+            }
+            model_entry m;
+            m.path = de.path().string();
+            m.name = de.path().filename().string();
+            m.size = (unsigned long long) de.file_size(ec2);
+            const std::string file_key = m.name + "|" + std::to_string(m.size);
+            for (const auto & s : seen_files) {
+                if (s == file_key) { dup = true; break; }
+            }
+            if (dup) {
+                continue;
+            }
+            seen_paths.push_back(key);
+            seen_files.push_back(file_key);
+            out.push_back(m);
+        }
+    }
+    std::sort(out.begin(), out.end(),
+              [](const model_entry & a, const model_entry & b) { return a.name < b.name; });
+    return out;
+}
+
+// ===========================================================================
+// command line / UI state
+// ===========================================================================
+
+struct cli_options {
+    std::string model;
+    std::string prompt;   // empty by default: the user types it on the run page
+    std::string sysmsg;
+    bool  prompt_set = false;
+    bool  api_only   = false;
+    bool  chat       = false;
+    bool  moe        = false;
+    bool  api        = false;
+    bool  n_ctx_set  = false;
+    int   n_ctx      = 16;
+    int   n_predict  = 256;
+    int   n_threads  = 4;
+    int   n_ubatch   = 4;
+    float temp       = 0.70f;
+    int   top_k      = 40;
+    float top_p      = 0.95f;
+    int   port       = 4000;
+    bool  help       = false;
+};
+
+struct gen_job {
+    std::thread             thread;
+    std::atomic<bool>       done{ false };
+    std::mutex              mtx;
+    diskui::gen_result      result;
+    bool                    running = false;
+
+    void join_and_collect(diskui::gen_result & out) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+        std::lock_guard<std::mutex> lk(mtx);
+        out = result;
+        running = false;
+        done.store(false);
+    }
+};
+
+enum class page_t { model, settings, run };
+
+struct ui_state {
+    page_t page = page_t::model;
+
+    std::vector<model_entry> models;
+    int               model_sel = 0;
+    bool              model_fixed = false;
+    std::string       model_path;
+
+    int   sel     = 0;
+    int   n_ctx   = 16;
+    float temp    = 0.70f;
+    bool  chat    = false;
+    bool  moe     = false;
+    bool  api_on  = false;
+    int   arena_mb = 0;      // disk arena size in MiB, 0 = auto (launcher / LLAMA_DISK_STREAM_MB)
+    int   ctx_max = 4096;
+    int   tmpl_extra = -1;
+    bool  settings_ready = false;
+    int   n_ctx_before_chat = 16;
+
+    std::string prompt;
+    std::string sysmsg;
+    bool        editing = false;
+    std::string edit_backup;
+
+    gen_job            job;
+    diskui::gen_result last;
+    std::string        status;
+    bool               status_error = false;
+    bool               have_run = false;
+};
+
+ui_state       g_ui;
+cli_options    g_cli;
+diskui::api::server g_api;
+
+// ---- frame helpers ---------------------------------------------------------
+
+void frame_pad(std::vector<row> & f, const std::vector<row> & footer) {
+    const int max_body = std::max(0, g_rows - (int) footer.size());
+    if ((int) f.size() > max_body) {
+        f.resize((size_t) max_body);
+    }
+    while ((int) f.size() < max_body) {
+        f.push_back(row{ "", S_NORM });
+    }
+    for (const auto & r : footer) {
+        f.push_back(r);
+    }
+}
+
+row rule_row(const std::string & title, int indent = 1) {
+    std::string s((size_t) indent, ' ');
+    s += "── " + title + " ";
+    int w = disp_width(s);
+    while (w < g_cols - 1) {
+        s += "─";
+        ++w;
+    }
+    return row{ s, S_CYAN };
+}
+
+std::string bar_text(double frac, int width) {
+    if (width < 4) {
+        width = 4;
+    }
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    const int full = (int) (frac * width + 0.5);
+    std::string s;
+    for (int i = 0; i < width; ++i) {
+        s += (i < full) ? "█" : "░";
+    }
+    return s;
+}
+
+std::string on_off(bool b) {
+    return i18n::tr(b ? "common.on" : "common.off");
+}
+
+// internal finish reason ("stop"/"length"/"cancelled"/"error") -> UI text
+std::string finish_label(const std::string & f) {
+    if (f == "length")    return i18n::tr("common.finish_length");
+    if (f == "cancelled") return i18n::tr("common.finish_cancelled");
+    if (f == "error")     return i18n::tr("common.finish_error");
+    return i18n::tr("common.finish_stop");
+}
+
+// engine gen_result.error is kept English (it is also returned in the HTTP JSON
+// message field); translate the known ones for the TUI status line
+std::string error_label(const std::string & e) {
+    if (e == "no model loaded")                    return i18n::tr("eng.no_model_loaded");
+    if (e == "failed to tokenize the prompt")      return i18n::tr("eng.tokenize_failed");
+    if (e == "context is too small for this prompt") return i18n::tr("eng.ctx_too_small");
+    if (e == "failed to create a llama_context")   return i18n::tr("eng.ctx_create_failed");
+    if (e == "generation threw")                   return i18n::tr("st.gen_threw");
+    if (e.rfind("prefill decode failed at token ", 0) == 0) {
+        return i18n::trf("eng.prefill_failed_fmt", atoi(e.c_str() + 28));
+    }
+    if (e.rfind("decode failed at token ", 0) == 0) {
+        return i18n::trf("eng.decode_failed_fmt", atoi(e.c_str() + 23));
+    }
+    if (e.rfind("busy: ", 0) == 0) {
+        return i18n::trf("st.busy_fmt", e.c_str() + 6);
+    }
+    return e;
+}
+
+std::string basename_of(const std::string & p) {
+    const size_t s = p.find_last_of("/\\");
+    return s == std::string::npos ? p : p.substr(s + 1);
+}
+
+// ===========================================================================
+// frames
+// ===========================================================================
+
+std::vector<row> frame_model_picker() {
+    std::vector<row> f;
+    auto push = [&](std::string s, style_t st) { f.push_back(row{ std::move(s), st }); };
+
+    push("", S_NORM);
+    push(" " + pad_to(i18n::tr("title.model"), g_cols - 2) + " ", S_BAR);
+    push("", S_NORM);
+
+    if (g_ui.models.empty()) {
+        push(i18n::tr("pick.no_model"), S_RED);
+        push("", S_NORM);
+        push(i18n::tr("pick.where"), S_DIM);
+        for (const auto & d : model_dirs()) {
+            push("    " + clip(d, g_cols - 5), S_DIM);
+        }
+        if (model_dirs().empty()) {
+            push(i18n::tr("pick.none_dirs"), S_DIM);
+        }
+        push("", S_NORM);
+        push(i18n::tr("pick.example"), S_DIM);
+        push(i18n::tr("pick.example_cmd"), S_DIM);
+        push("", S_NORM);
+        push(i18n::tr("pick.or_pass"), S_DIM);
+    } else {
+        push(i18n::trf("pick.choose_fmt", (int) g_ui.models.size()), S_CYAN_BOLD);
+        push("", S_NORM);
+        const int list_rows = std::max(3, g_rows - 8);
+        int first = std::max(0, g_ui.model_sel - list_rows / 2);
+        if (first + list_rows > (int) g_ui.models.size()) {
+            first = std::max(0, (int) g_ui.models.size() - list_rows);
+        }
+        for (int i = first; i < (int) g_ui.models.size() && i < first + list_rows; ++i) {
+            const model_entry & m = g_ui.models[(size_t) i];
+            const bool sel = (i == g_ui.model_sel);
+            std::string left = std::string(sel ? " ▸ " : "   ") + m.name;
+            push(pad_between(clip(left, g_cols - 14), diskui::human_bytes(m.size) + " ",
+                             g_cols - 1),
+                 sel ? S_SEL : S_NORM);
+        }
+    }
+
+    std::vector<row> footer;
+    footer.push_back(row{ "", S_NORM });
+    footer.push_back(row{ i18n::tr("pick.footer"), S_DIM });
+    frame_pad(f, footer);
+    return f;
+}
+
+std::vector<row> frame_settings() {
+    diskui::engine & eng = diskui::engine::get();
+    llama_disk::llama_disk_stats ds;
+    llama_disk::get_stats(&ds);
+
+    std::vector<row> f;
+    auto push  = [&](std::string s, style_t st) { f.push_back(row{ std::move(s), st }); };
+    auto blank = [&] { push("", S_NORM); };
+
+    const std::string base_name = basename_of(g_ui.model_path);
+
+    // header ---------------------------------------------------------------
+    push(" " + pad_to(i18n::tr("title.settings"), g_cols - 2) + " ", S_BAR);
+    push(i18n::trf("set.model_fmt", clip(base_name, g_cols - 11).c_str()), S_BOLD);
+    push(i18n::trf("set.ctx_max_fmt", g_ui.ctx_max, eng.n_layer(),
+                   diskui::human_bytes(ds.arena_bytes).c_str()), S_DIM);
+    if (!g_short) {
+        push(i18n::trf("set.stream_fmt", diskui::human_bytes(ds.registered_bytes).c_str(),
+                       ds.tensors, ds.direct_io ? i18n::tr("common.on") : i18n::tr("common.off")),
+             S_DIM);
+    }
+    blank();
+
+    f.push_back(rule_row(i18n::tr("set.section"), 1));
+    blank();
+
+    const int label_w = g_narrow ? 17 : 20;
+    const int value_w = g_narrow ? 6 : 9;
+
+    char v_temp[32];
+    snprintf(v_temp, sizeof(v_temp), "%.2f", g_ui.temp);
+
+    const std::string arena_value = g_ui.arena_mb > 0 ? std::to_string(g_ui.arena_mb)
+                                                      : i18n::tr("common.auto");
+    const std::string values[6] = {
+        std::to_string(g_ui.n_ctx),
+        v_temp,
+        on_off(g_ui.chat),
+        on_off(g_ui.moe),
+        arena_value,
+        on_off(g_ui.api_on),
+    };
+    const std::string labels[6] = {
+        i18n::tr("set.context"),
+        i18n::tr("set.temperature"),
+        i18n::tr("set.chat_template"),
+        i18n::tr("set.moe_path"),
+        i18n::tr("set.arena"),
+        i18n::tr("set.api_server"),
+    };
+    const std::string hints[6] = {
+        i18n::trf("set.ctx_hint_fmt", g_ui.ctx_max),
+        i18n::tr("set.temp_hint"),
+        (g_ui.tmpl_extra >= 0)
+            ? i18n::trf("set.chat_hint_fmt", g_ui.tmpl_extra)
+            : i18n::tr("set.chat_hint_unknown"),
+        i18n::tr("set.moe_hint"),
+        i18n::tr("set.arena_hint"),
+        i18n::trf("set.api_hint_fmt", g_cli.port),
+    };
+
+    for (int i = 0; i < 6; ++i) {
+        const bool sel = (g_ui.sel == i);
+        std::string s = "  ";
+        s += sel ? "▸ " : "  ";
+        s += pad_to(labels[i], label_w);
+        s += pad_to(values[i], value_w);
+        if (!g_narrow) {
+            s += "   ";
+            s += hints[i];
+        }
+        push(s, sel ? S_SEL : S_NORM);
+    }
+
+    blank();
+    if (g_narrow) {
+        push("  " + clip(hints[g_ui.sel], g_cols - 4), S_DIM);
+        blank();
+    }
+
+    // status ---------------------------------------------------------------
+    if (!g_short) {
+        f.push_back(rule_row(i18n::tr("set.status_section"), 1));
+    } else {
+        push(std::string("  ── ") + i18n::tr("set.status_section") + " ──", S_CYAN);
+    }
+    {
+        const bool api_busy = diskui::engine::get().busy_owner() == diskui::owner::api;
+        const bool tui_busy = diskui::engine::get().busy_owner() == diskui::owner::tui;
+        std::string st = g_ui.status;
+        if (api_busy) {
+            st = i18n::trf("set.status_busy_fmt", diskui::engine::get().busy_label().c_str());
+        } else if (tui_busy) {
+            st = i18n::tr("set.tui_running");
+        }
+        push("  " + clip(st, g_cols - 4),
+             api_busy ? S_YELLOW : (g_ui.status_error ? S_RED : S_DIM));
+    }
+    if (!g_short) {
+        push("  " + clip(g_ui.sysmsg.empty()
+                             ? i18n::tr("set.system_prompt_none")
+                             : i18n::trf("set.system_prompt_fmt", g_ui.sysmsg.c_str()),
+                         g_cols - 4),
+             S_DIM);
+    }
+
+    // footer ---------------------------------------------------------------
+    std::vector<row> footer;
+    footer.push_back(row{ "", S_NORM });
+    footer.push_back(row{ g_narrow ? i18n::tr("set.footer_narrow") : i18n::tr("set.footer_wide"),
+                            S_DIM });
+    if (g_ui.api_on) {
+        footer.push_back(row{ i18n::trf("set.api_footer_fmt", g_cli.port), S_GREEN });
+    }
+
+    // the log of the last start up fills the rest of the page, so the settings
+    // page does not look empty on a tall phone terminal
+    {
+        const int rem = g_rows - (int) f.size() - (int) footer.size();
+        if (rem >= 4) {
+            f.push_back(rule_row(i18n::tr("set.log_section"), 1));
+            std::vector<std::string> logs = log_tail(rem - 1, g_cols - 4);
+            while ((int) logs.size() < rem - 1) {
+                logs.insert(logs.begin(), "");
+            }
+            for (const auto & l : logs) {
+                push("  " + clip(l, g_cols - 4), S_DIM);
+            }
+        }
+    }
+
+    frame_pad(f, footer);
+    return f;
+}
+
+std::vector<row> frame_run() {
+    diskui::engine & eng = diskui::engine::get();
+    const diskui::live_state ls  = eng.snapshot();
+    const diskui::owner busy_owner = eng.busy_owner();
+    const bool api_busy   = (busy_owner == diskui::owner::api);
+    const bool tui_running = g_ui.job.running;
+    const bool active      = ls.active;
+    const int  phase       = ls.phase;
+
+    llama_disk::llama_disk_stats ds;
+    llama_disk::get_stats(&ds);
+
+    std::vector<row> f;
+    auto push = [&](std::string s, style_t st) { f.push_back(row{ std::move(s), st }); };
+
+    const std::string base_name = basename_of(g_ui.model_path);
+
+    // header ---------------------------------------------------------------
+    push(" " + pad_to(i18n::tr("title.run"), g_cols - 2) + " ", S_BAR);
+    push("  " + clip(base_name, g_cols - 3), S_BOLD);
+    push(clip(i18n::trf("run.meta_fmt", g_ui.n_ctx, g_ui.temp,
+                        g_ui.chat ? i18n::tr("common.template") : i18n::tr("common.raw"),
+                        on_off(g_ui.moe).c_str(), on_off(g_ui.api_on).c_str()),
+              g_cols - 1), S_DIM);
+
+    // prompt ---------------------------------------------------------------
+    f.push_back(rule_row(i18n::tr("run.prompt_section"), 1));
+    {
+        std::string p = "  > " + g_ui.prompt;
+        if (g_ui.editing) {
+            p += "▌";
+        } else if (!tui_running) {
+            p += i18n::tr("run.prompt_hint");
+        }
+        push(clip(p, g_cols - 1), g_ui.editing ? S_YELLOW : S_BOLD);
+    }
+    if (!g_ui.editing && !tui_running && g_ui.prompt.empty()) {
+        push(clip(std::string("  ") + i18n::tr("run.prompt_empty_hint"), g_cols - 1), S_DIM);
+    }
+
+    // progress: a fixed height block, so the page never jumps while decoding
+    f.push_back(rule_row(i18n::tr("run.progress_section"), 1));
+    {
+        const int bar_w = g_narrow ? 12 : 22;
+        std::vector<row> prog;
+
+        // 1) prefill
+        if (active && phase == 2) {
+            prog.push_back(row{ clip(i18n::trf("run.prefill_live_fmt",
+                                       bar_text((double) ls.done / (double) std::max(1, ls.total), bar_w).c_str(),
+                                       ls.done, ls.total, diskui::fmt_seconds(ls.io_s).c_str(),
+                                       diskui::fmt_seconds(ls.cmp_s).c_str()),
+                                   g_cols - 1), S_NORM });
+        } else if (g_ui.have_run) {
+            prog.push_back(row{ clip(i18n::trf("run.prefill_done_fmt", g_ui.last.n_prompt,
+                                       diskui::fmt_seconds(g_ui.last.pp_s).c_str()),
+                                   g_cols - 1), S_DIM });
+        } else if (active) {
+            prog.push_back(row{ clip(i18n::trf("run.prefill_active_fmt", ls.n_prompt),
+                                   g_cols - 1), S_DIM });
+        } else {
+            prog.push_back(row{ i18n::tr("run.prefill_none"), S_DIM });
+        }
+
+        // 2) generate
+        if (active && phase == 3) {
+            const double tps = ls.gen_s > 0.001 ? ls.done / ls.gen_s : 0.0;
+            prog.push_back(row{ clip(i18n::trf("run.gen_live_fmt",
+                                       bar_text((double) ls.done / (double) std::max(1, ls.total), bar_w).c_str(),
+                                       ls.done, ls.total, tps, ls.layer + 1,
+                                       ls.n_layer > 0 ? ls.n_layer : eng.n_layer()),
+                                   g_cols - 1), S_NORM });
+        } else if (g_ui.have_run) {
+            prog.push_back(row{ clip(i18n::trf("run.gen_done_fmt", g_ui.last.n_gen,
+                                       g_ui.last.gen_s > 0.001 ? g_ui.last.n_gen / g_ui.last.gen_s : 0.0,
+                                       finish_label(g_ui.last.finish).c_str()),
+                                   g_cols - 1), S_DIM });
+        } else if (active) {
+            const double tps = ls.gen_s > 0.001 ? ls.done / ls.gen_s : 0.0;
+            prog.push_back(row{ clip(i18n::trf("run.gen_active_fmt", ls.n_gen, tps),
+                                   g_cols - 1), S_DIM });
+        } else {
+            prog.push_back(row{ i18n::tr("run.gen_none"), S_DIM });
+        }
+
+        // 3) disk counters
+        {
+            const unsigned long long bytes = active ? ls.bytes : ds.bytes;
+            const unsigned long long loads = active ? ls.loads : ds.loads;
+            const unsigned long long evict = active ? ls.evictions : ds.evictions;
+            const double io  = active ? ls.io_s  : 0.0;
+            const double cmp = active ? ls.cmp_s : 0.0;
+            if (active) {
+                prog.push_back(row{ clip(i18n::trf("run.disk_live_fmt",
+                                           diskui::human_bytes(bytes).c_str(), loads, evict,
+                                           diskui::fmt_seconds(io).c_str(),
+                                           diskui::fmt_seconds(cmp).c_str()),
+                                       g_cols - 1), S_DIM });
+            } else {
+                prog.push_back(row{ clip(i18n::trf("run.disk_idle_fmt",
+                                           diskui::human_bytes(ds.registered_bytes).c_str(),
+                                           ds.tensors),
+                                       g_cols - 1), S_DIM });
+            }
+        }
+
+        // 4) state line
+        if (api_busy) {
+            prog.push_back(row{ clip(i18n::trf("run.api_busy_fmt", eng.busy_label().c_str()),
+                                     g_cols - 1), S_YELLOW });
+        } else if (tui_running || (active && ls.who == diskui::owner::tui)) {
+            prog.push_back(row{ i18n::tr("run.tui_running"), S_GREEN });
+        } else if (g_ui.have_run) {
+            prog.push_back(row{ clip(i18n::trf("run.idle_last_fmt", g_ui.last.n_gen,
+                                       finish_label(g_ui.last.finish).c_str()),
+                                   g_cols - 1), S_DIM });
+        } else {
+            prog.push_back(row{ i18n::tr("run.idle_hint"), S_DIM });
+        }
+
+        const int want = g_short ? 3 : 4;
+        for (int i = 0; i < want && i < (int) prog.size(); ++i) {
+            f.push_back(prog[(size_t) i]);
+        }
+    }
+
+    // footer ---------------------------------------------------------------
+    std::vector<row> footer;
+    footer.push_back(row{ "", S_NORM });
+    {
+        const std::string left = g_narrow ? i18n::tr("run.footer_narrow")
+                                          : i18n::tr("run.footer_wide");
+        std::string right;
+        if (api_busy) {
+            right = i18n::tr("run.api_badge_busy");
+        } else if (g_ui.api_on) {
+            right = i18n::trf("run.api_badge_fmt", g_cli.port);
+        }
+        footer.push_back(row{ pad_between(left, right, g_cols - 1), S_DIM });
+    }
+
+    // answer (or a model summary before the first run) + log fill the rest ----
+    const bool show_answer = ls.active || g_ui.have_run;
+    const std::string answer = ls.active ? ls.answer
+                                         : (g_ui.have_run ? g_ui.last.text : std::string());
+
+    int rem = std::max(0, g_rows - (int) f.size() - (int) footer.size());
+    int log_content = g_short ? 2 : (g_narrow ? 6 : 3);
+    int a_lines = rem - 2 - log_content;
+    while (a_lines < 3 && log_content > 0) {
+        --log_content;
+        ++a_lines;
+    }
+    if (a_lines < 1) {
+        a_lines = std::max(0, rem - 1);
+        log_content = 0;
+    }
+
+    f.push_back(rule_row(show_answer ? i18n::tr("run.answer_section")
+                                     : i18n::tr("run.model_section"), 1));
+    --a_lines;
+
+    if (show_answer) {
+        std::vector<std::string> lines;
+        if (!answer.empty()) {
+            lines = wrap_text(answer, g_cols - 4);
+        }
+        // keep the tail when the answer scrolls, otherwise start at the top of
+        // the section so the first streamed tokens appear right under "Answer"
+        if ((int) lines.size() > a_lines) {
+            lines = std::vector<std::string>(lines.end() - a_lines, lines.end());
+        }
+        while ((int) lines.size() < a_lines) {
+            lines.push_back("");
+        }
+        for (int i = 0; i < a_lines; ++i) {
+            std::string s = "  " + lines[(size_t) i];
+            if (i == a_lines - 1 && ls.active && ls.phase == 3) {
+                s += "▌";
+            }
+            push(clip(s, g_cols - 1), S_NORM);
+        }
+    } else {
+        // before the first run the space shows the loaded model instead of an
+        // empty box: this is the information a user opens the app for
+        const std::string tmpl_note = g_ui.tmpl_extra >= 0
+            ? ("+" + std::to_string(g_ui.tmpl_extra) + " tok")
+            : i18n::tr("common.none");
+
+        std::vector<std::string> info;
+        info.push_back(i18n::trf("run.info_model_fmt", clip(base_name, g_cols - 12).c_str()));
+        info.push_back(i18n::trf("run.info_path_fmt", clip(g_ui.model_path, g_cols - 12).c_str()));
+        info.push_back(i18n::trf("run.info_size_fmt",
+                                 diskui::human_bytes(ds.registered_bytes).c_str(), ds.tensors));
+        info.push_back(i18n::trf("run.info_arena_fmt",
+                                 diskui::human_bytes(ds.arena_bytes).c_str(),
+                                 ds.direct_io ? i18n::tr("common.on") : i18n::tr("common.off"),
+                                 ds.mlock ? i18n::tr("common.on") : i18n::tr("common.off")));
+        info.push_back(i18n::trf("run.info_context_fmt", g_ui.n_ctx, g_ui.ctx_max,
+                                 tmpl_note.c_str()));
+        info.push_back(i18n::trf("run.info_runtime_fmt", g_cli.n_threads, g_cli.n_ubatch,
+                                 g_cli.n_predict));
+        if (g_ui.api_on) {
+            info.push_back(i18n::trf("run.info_api_fmt", g_cli.port));
+        }
+        info.push_back("");
+        info.push_back(i18n::tr("run.info_hint"));
+        for (int i = 0; i < a_lines; ++i) {
+            if (i < (int) info.size()) {
+                push(clip("  " + info[(size_t) i], g_cols - 1), i + 1 == (int) info.size() ? S_BOLD : S_DIM);
+            } else {
+                push("", S_NORM);
+            }
+        }
+    }
+
+    if (log_content > 0) {
+        f.push_back(rule_row(i18n::tr("run.log_section"), 1));
+        --log_content;
+        log_content = std::max(0, log_content);
+        std::vector<std::string> logs = log_tail(log_content, g_cols - 4);
+        while ((int) logs.size() < log_content) {
+            logs.insert(logs.begin(), "");
+        }
+        for (const auto & l : logs) {
+            push("  " + clip(l, g_cols - 4), S_DIM);
+        }
+    }
+
+    frame_pad(f, footer);
+    return f;
+}
+
+// ===========================================================================
+// generation control
+// ===========================================================================
+
+diskui::gen_params make_params() {
+    diskui::gen_params gp;
+    gp.n_ctx     = g_ui.n_ctx;
+    gp.n_predict = g_cli.n_predict;
+    gp.temp      = g_ui.temp;
+    gp.top_k     = g_cli.top_k;
+    gp.top_p     = g_cli.top_p;
+    gp.n_threads = g_cli.n_threads;
+    gp.n_ubatch  = g_cli.n_ubatch;
+    return gp;
+}
+
+int current_pid() {
+#if defined(_WIN32)
+    return (int) GetCurrentProcessId();
 #else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (int64_t) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    return (int) getpid();
 #endif
 }
 
-static std::string fmt_clock(int64_t ms) {
-    char buf[32];
-    const int64_t s = ms / 1000;
-    snprintf(buf, sizeof(buf), "%2lld:%02lld", (long long) (s / 60), (long long) (s % 60));
-    return buf;
+std::vector<diskui::chat_message> make_messages(const std::string & prompt) {
+    std::vector<diskui::chat_message> msgs;
+    if (!g_ui.sysmsg.empty()) {
+        msgs.push_back(diskui::chat_message{ "system", g_ui.sysmsg });
+    }
+    msgs.push_back(diskui::chat_message{ "user", prompt });
+    return msgs;
 }
 
-struct opts {
-    std::string model;
-    std::string question;
-    int n_ctx     = 256;
-    int n_ubatch  = 4;
-    int n_threads = 4;
-    int n_predict = 256;
-    float temp    = 1.0f;
-    int top_k     = 20;
-    float top_p   = 0.95f;
-    bool  raw     = true;
-    std::string sysmsg;
-};
+bool load_selected_model();   // defined below, used by the settings actions
 
-int main(int argc, char ** argv) {
-    opts o;
-
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "-m" && i + 1 < argc)         { o.model = argv[++i]; }
-        else if (a == "-c" && i + 1 < argc)    { o.n_ctx = atoi(argv[++i]); }
-        else if (a == "-ub" && i + 1 < argc)   { o.n_ubatch = atoi(argv[++i]); }
-        else if (a == "-t" && i + 1 < argc)    { o.n_threads = atoi(argv[++i]); }
-        else if (a == "-n" && i + 1 < argc)    { o.n_predict = atoi(argv[++i]); }
-        else if (a == "--temp" && i + 1 < argc){ o.temp = (float) atof(argv[++i]); }
-        else if (a == "--top-k" && i + 1 < argc){ o.top_k = atoi(argv[++i]); }
-        else if (a == "--top-p" && i + 1 < argc){ o.top_p = (float) atof(argv[++i]); }
-        else if (a == "-q" && i + 1 < argc)    { o.question = argv[++i]; }
-        else if (a == "--debug")                { setenv("LLAMA_DISK_DEBUG", "1", 1); }
-        else if (a == "--raw")                  { o.raw = true; }
-        else if (a == "--chat")                 { o.raw = false; }
-        else if (a == "--sys" && i + 1 < argc)  { o.sysmsg = argv[++i]; }
-        else if (!a.empty() && a[0] != '-')    { o.question = a; }
+void start_inference() {
+    diskui::engine & eng = diskui::engine::get();
+    if (g_ui.job.running) {
+        return;
+    }
+    if (g_ui.prompt.empty()) {
+        g_ui.editing     = true;
+        g_ui.edit_backup = g_ui.prompt;
+        g_ui.status      = i18n::tr("st.type_prompt");
+        g_ui.status_error = false;
+        invalidate();
+        return;
+    }
+    if (!eng.loaded()) {
+        g_ui.status = i18n::tr("st.no_model");
+        g_ui.status_error = false;
+        return;
     }
 
-    if (o.model.empty()) {
-        fprintf(stderr, "usage: disktui -m model.gguf [-c 256] [-ub 4] [-t 4] [-n 256] [-q question]\n");
-        return 1;
-    }
-
-    // defaults for the disk streaming layer, the caller can override any of them
-    auto set_default_env = [](const char * k, const char * v) {
-        if (getenv(k) == nullptr) {
-            setenv(k, v, 1);
+    // the MoE switch and the disk arena size are read when the model is
+    // registered, so changing either needs a reload; the settings page says so
+    const bool moe_changed   = eng.loaded_with_moe() != g_ui.moe;
+    const bool arena_changed = eng.requested_arena_mb() != g_ui.arena_mb;
+    if (moe_changed || arena_changed) {
+        if (moe_changed) {
+            g_ui.status = i18n::tr(g_ui.moe ? "st.reloading_moe_on" : "st.reloading_moe_off");
+        } else {
+            g_ui.status = i18n::tr("st.reloading_fmt");
         }
-    };
-    set_default_env("LLAMA_DISK_ODIRECT",   "1");
-    set_default_env("LLAMA_DISK_MLOCK",     "1");
-    set_default_env("LLAMA_DISK_PREFETCH",  "0");
-    set_default_env("LLAMA_DISK_WINDOW",    "0");
-    set_default_env("LLAMA_DISK_OUT_CHUNK", "0");
-    set_default_env("GGML_CPU_DISABLE_FUSION", "1");
+        g_ui.status_error = false;
+        invalidate();
+        paint_frame(frame_run());
+        std::string err;
+        if (!eng.load(g_ui.model_path, g_ui.moe, err, g_ui.arena_mb)) {
+            g_ui.status = i18n::trf("st.reload_failed_fmt", error_label(err).c_str());
+            g_ui.status_error = true;
+            route_log("! " + i18n::trf("st.reload_failed_fmt", error_label(err).c_str()));
+            invalidate();
+            return;
+        }
+        invalidate();
+    }
 
-    term_size();
+    const diskui::gen_params gp = make_params();
+    const std::string     prompt = g_ui.prompt;
+    const bool            chat   = g_ui.chat;
+    std::vector<diskui::chat_message> msgs;
+    if (chat) {
+        msgs = make_messages(prompt);
+    }
+    g_cancel_in_progress.store(false);
+    g_ui.job.running = true;
+    g_ui.job.done.store(false);
+    g_ui.last = diskui::gen_result();
+    g_ui.status = i18n::tr("st.running");
+    g_ui.status_error = false;
+    invalidate();
 
-    // alternate screen, hide cursor
-    out("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
-    fflush(stdout);
+    gen_job * job = &g_ui.job;
+    job->thread = std::thread([job, gp, msgs, prompt, chat, &eng] {
+        diskui::gen_result r;
+        // the slot is taken inside the worker: a std::mutex has to be unlocked by
+        // the thread that locked it
+        if (!eng.acquire(diskui::owner::tui, "TUI")) {
+            r.ok     = false;
+            r.finish = "error";
+            r.error  = "busy: " + eng.busy_label();
+            {
+                std::lock_guard<std::mutex> lk(job->mtx);
+                job->result = std::move(r);
+            }
+            job->done.store(true);
+            return;
+        }
+        try {
+            if (chat) {
+                r = eng.generate_chat(msgs, gp);
+            } else {
+                r = eng.generate_raw(prompt, gp);
+            }
+        } catch (const std::exception & e) {
+            r.ok = false;
+            r.finish = "error";
+            r.error = e.what();
+        } catch (...) {
+            r.ok = false;
+            r.finish = "error";
+            r.error = "generation threw";
+        }
+        {
+            std::lock_guard<std::mutex> lk(job->mtx);
+            job->result = std::move(r);
+        }
+        eng.release();
+        job->done.store(true);
+    });
+}
 
+void stop_inference() {
+    if (!g_ui.job.running) {
+        return;
+    }
+    g_cancel_in_progress.store(true);
+    diskui::engine::get().request_cancel();
+    g_ui.status = i18n::tr("st.cancelling");
+    g_ui.status_error = false;
+}
+
+void poll_generation() {
+    if (!g_ui.job.running || !g_ui.job.done.load()) {
+        return;
+    }
+    diskui::gen_result r;
+    g_ui.job.join_and_collect(r);
+    g_ui.last = std::move(r);
+    g_ui.have_run = true;
+    g_cancel_in_progress.store(false);
+    if (g_ui.last.finish == "cancelled") {
+        g_ui.status = i18n::tr("st.cancelled");
+        g_ui.status_error = false;
+    } else if (g_ui.last.ok) {
+        g_ui.status = i18n::tr("st.done");
+        g_ui.status_error = false;
+    } else {
+        g_ui.status = i18n::trf("st.error_fmt", error_label(g_ui.last.error).c_str());
+        g_ui.status_error = true;
+    }
+    invalidate();
+}
+
+// ---- settings actions ------------------------------------------------------
+
+int ctx_for_template() {
+    const int extra = g_ui.tmpl_extra >= 0 ? g_ui.tmpl_extra : 16;   // 16 = documented fallback
+    return std::max(3, std::min(g_ui.ctx_max, 16 + extra));
+}
+
+void apply_chat_toggle() {
+    if (g_ui.chat) {
+        g_ui.n_ctx_before_chat = g_ui.n_ctx;
+        g_ui.n_ctx = ctx_for_template();
+    } else {
+        g_ui.n_ctx = std::max(3, std::min(g_ui.ctx_max, g_ui.n_ctx_before_chat));
+    }
+}
+
+bool start_api_server() {
+    diskui::api::options opt;
+    opt.port      = g_cli.port;
+    opt.n_ctx     = std::max(256, g_ui.n_ctx);
+    opt.n_predict = g_cli.n_predict;
+    opt.n_threads = g_cli.n_threads;
+    opt.n_ubatch  = g_cli.n_ubatch;
+    opt.temp      = g_ui.temp;
+    opt.top_k     = g_cli.top_k;
+    opt.top_p     = g_cli.top_p;
+    std::string err;
+    if (!g_api.start(opt, err)) {
+        g_ui.status = i18n::trf("st.api_start_failed_fmt", err.c_str());
+        g_ui.status_error = true;
+        route_log("! " + err);
+        return false;
+    }
+    return true;
+}
+
+void set_api_enabled(bool on) {
+    if (on == g_ui.api_on) {
+        return;
+    }
+    if (on) {
+        g_ui.api_on = start_api_server();
+        if (g_ui.api_on) {
+            g_ui.status = i18n::trf("st.api_listening_fmt", g_cli.port);
+            g_ui.status_error = false;
+        }
+    } else {
+        g_api.stop();
+        g_ui.api_on = false;
+        g_ui.status = i18n::tr("st.api_stopped");
+        g_ui.status_error = false;
+    }
+}
+
+// ===========================================================================
+// pages: model picker / settings / run
+// ===========================================================================
+
+bool load_selected_model() {
+    diskui::engine & eng = diskui::engine::get();
+
+    {
+        std::lock_guard<std::mutex> lk(g_log_mtx);
+        g_logbuf.clear();
+        g_logbuf.push_back(i18n::trf("log.model_switch_fmt", basename_of(g_ui.model_path).c_str()));
+    }
+
+    invalidate();
+    {
+        std::vector<row> f;
+        f.push_back(row{ "", S_NORM });
+        f.push_back(row{ " " + pad_to(i18n::tr("title.loading"), g_cols - 2) + " ", S_BAR });
+        f.push_back(row{ "", S_NORM });
+        f.push_back(row{ "  " + clip(g_ui.model_path, g_cols - 4), S_BOLD });
+        f.push_back(row{ "", S_NORM });
+        f.push_back(row{ i18n::tr("load.registering"), S_DIM });
+        frame_pad(f, std::vector<row>{ row{ "", S_NORM },
+                                       row{ i18n::tr("load.wait"), S_DIM } });
+        paint_frame(f);
+    }
+
+    std::string err;
+    if (!eng.load(g_ui.model_path, g_ui.moe, err, g_ui.arena_mb)) {
+        route_log("! " + i18n::trf("st.load_failed_fmt", err.c_str()));
+        std::vector<row> f;
+        f.push_back(row{ "", S_NORM });
+        f.push_back(row{ " " + pad_to(i18n::tr("title.load_failed"), g_cols - 2) + " ", S_BAR });
+        f.push_back(row{ "", S_NORM });
+        f.push_back(row{ "  " + clip(err, g_cols - 4), S_RED });
+        f.push_back(row{ "", S_NORM });
+        for (const auto & l : log_tail(6, g_cols - 4)) {
+            f.push_back(row{ "  " + clip(l, g_cols - 4), S_DIM });
+        }
+        frame_pad(f, std::vector<row>{ row{ "", S_NORM },
+                                       row{ i18n::tr("load.press_back"), S_DIM } });
+        paint_frame(f);
+        read_key(30000);
+        invalidate();
+        // with a pinned model there is nothing to fall back to
+        if (g_ui.model_fixed) {
+            g_signal = 1;
+        }
+        return false;
+    }
+
+    g_ui.ctx_max    = std::max(3, eng.n_ctx_train() > 0 ? eng.n_ctx_train() : 4096);
+    g_ui.tmpl_extra = eng.chat_template_extra_tokens();
+    const bool has_tmpl = eng.has_chat_template();
+
+    std::string note;
+
+    if (!g_ui.settings_ready) {
+        // first load of this session: take the defaults / command line overrides
+        g_ui.settings_ready = true;
+        g_ui.n_ctx = g_cli.n_ctx;
+        g_ui.chat  = g_cli.chat && has_tmpl;
+        g_ui.n_ctx_before_chat = g_ui.n_ctx;
+    } else if (g_ui.chat && !has_tmpl) {
+        // the new model cannot do templated turns, switch it off and say so
+        g_ui.chat = false;
+        note = i18n::tr("st.no_template_new_model");
+    }
+
+    // keep the settings of the session across a model switch, only clamp what
+    // the new model cannot hold
+    {
+        const int want = g_ui.n_ctx;
+        g_ui.n_ctx = std::max(3, std::min(g_ui.ctx_max, want));
+        if (g_ui.n_ctx != want) {
+            note = i18n::trf("st.ctx_clamped_fmt", g_ui.n_ctx, g_ui.ctx_max);
+        }
+        g_ui.n_ctx_before_chat = std::max(3, std::min(g_ui.ctx_max, g_ui.n_ctx_before_chat));
+        if (g_ui.chat) {
+            // never shrink below what the template itself needs
+            g_ui.n_ctx = std::max(g_ui.n_ctx, ctx_for_template());
+        }
+    }
+
+    // the API keeps serving the newly loaded model when it was on
+    if (g_ui.api_on) {
+        g_api.stop();
+        if (!start_api_server()) {
+            g_ui.api_on = false;
+            note = note.empty() ? i18n::tr("st.api_restart_failed") : note;
+        }
+    }
+
+    g_ui.status = note.empty() ? i18n::tr("st.ready") : note;
+    g_ui.status_error = false;
+    g_ui.page   = page_t::settings;
+    invalidate();
+    return true;
+}
+
+
+bool start_from_settings() {
+    if (!diskui::engine::get().loaded()) {
+        if (!load_selected_model()) {
+            return true;
+        }
+    }
+    g_ui.page = page_t::run;
+    if (g_ui.prompt.empty()) {
+        // no canned prompt: put the cursor in the prompt box and let the user type
+        g_ui.editing     = true;
+        g_ui.edit_backup = g_ui.prompt;
+    }
+    invalidate();
+    return true;
+}
+
+// returns false when the application should exit
+bool handle_model_picker(int key) {
+    if (key == 'q' || key == K_ESC) {
+        return false;
+    }
+    if (key == 'r') {
+        g_ui.models = scan_models();
+        g_ui.model_sel = 0;
+        invalidate();
+        return true;
+    }
+    if (g_ui.models.empty()) {
+        return true;
+    }
+    if (key == K_UP) {
+        g_ui.model_sel = (g_ui.model_sel + (int) g_ui.models.size() - 1) % (int) g_ui.models.size();
+        invalidate();
+    } else if (key == K_DOWN) {
+        g_ui.model_sel = (g_ui.model_sel + 1) % (int) g_ui.models.size();
+        invalidate();
+    } else if (key == K_ENTER || key == 's') {
+        g_ui.model_path = g_ui.models[(size_t) g_ui.model_sel].path;
+        load_selected_model();
+    }
+    return true;
+}
+
+bool handle_settings(int key) {
+    if (key == 'q' || key == K_ESC) {
+        return false;
+    }
+    if (key == K_UP) {
+        g_ui.sel = (g_ui.sel + 5) % 6;
+        invalidate();
+        return true;
+    }
+    if (key == K_DOWN) {
+        g_ui.sel = (g_ui.sel + 1) % 6;
+        invalidate();
+        return true;
+    }
+
+    const bool left  = (key == K_LEFT);
+    const bool right = (key == K_RIGHT);
+    const bool enter = (key == K_ENTER || key == ' ');
+
+    if (g_ui.sel == 0 && (left || right)) {
+        int step = 1;
+        if (g_ui.n_ctx > 64) {
+            step = 64;
+        } else if (g_ui.n_ctx > 16) {
+            step = 4;
+        }
+        g_ui.n_ctx += right ? step : -step;
+        g_ui.n_ctx = std::max(3, std::min(g_ui.ctx_max, g_ui.n_ctx));
+        return true;
+    }
+    if (g_ui.sel == 0 && key >= '0' && key <= '9') {
+        // typing a number replaces the value; digits typed in quick succession
+        // are appended to it
+        static int     typed = -1;
+        static int64_t typed_at = 0;
+        const int64_t now = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (typed < 0 || now - typed_at > 1500) {
+            typed = 0;
+        }
+        typed = typed * 10 + (key - '0');
+        typed_at = now;
+        if (typed > g_ui.ctx_max) {
+            typed = g_ui.ctx_max;
+        }
+        g_ui.n_ctx = std::max(3, typed);
+        return true;
+    }
+    if (g_ui.sel == 1 && (left || right)) {
+        g_ui.temp += right ? 0.05f : -0.05f;
+        g_ui.temp = std::max(0.0f, std::min(1.0f, g_ui.temp));
+        g_ui.temp = (float) ((int) (g_ui.temp * 100.0f + 0.5f)) / 100.0f;
+        return true;
+    }
+    if (g_ui.sel == 2 && enter) {
+        g_ui.chat = !g_ui.chat;
+        apply_chat_toggle();
+        return true;
+    }
+    if (g_ui.sel == 3 && enter) {
+        g_ui.moe = !g_ui.moe;
+        return true;
+    }
+    if (g_ui.sel == 4) {
+        // disk arena size in MiB; 0 = auto (keep the launcher / LLAMA_DISK_STREAM_MB value)
+        if (left || right) {
+            if (g_ui.arena_mb <= 0) {
+                g_ui.arena_mb = right ? 512 : 2048;
+            } else if (right) {
+                g_ui.arena_mb = g_ui.arena_mb >= 2048 ? 2048 : g_ui.arena_mb + 128;
+            } else {
+                g_ui.arena_mb = g_ui.arena_mb - 128;
+                if (g_ui.arena_mb < 128) {
+                    g_ui.arena_mb = 0;   // stepping left from 128 goes back to auto
+                }
+            }
+            return true;
+        }
+        if (key >= '0' && key <= '9') {
+            static int     a_typed = -1;
+            static int64_t a_at    = 0;
+            const int64_t now = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (a_typed < 0 || now - a_at > 1500) {
+                a_typed = 0;
+            }
+            if (a_typed < 10000) {
+                a_typed = a_typed * 10 + (key - '0');
+            }
+            a_at = now;
+            g_ui.arena_mb = (a_typed == 0) ? 0 : std::max(128, std::min(2048, a_typed));
+            return true;
+        }
+    }
+    if (g_ui.sel == 5 && enter) {
+        set_api_enabled(!g_ui.api_on);
+        return true;
+    }
+    if (key == 's') {
+        return start_from_settings();
+    }
+    if (key == 'c') {
+        if (!g_ui.model_fixed && g_ui.models.size() > 1) {
+            // stop serving the old model, but remember that the API was on: the
+            // next model loads and the server comes back up on it
+            g_api.stop();
+            diskui::engine::get().unload();
+            g_ui.page = page_t::model;
+            invalidate();
+        }
+        return true;
+    }
+    return true;
+}
+
+bool handle_run(int key) {
+    diskui::engine & eng = diskui::engine::get();
+
+    if (g_ui.editing) {
+        if (key == K_ENTER) {
+            g_ui.editing = false;
+            invalidate();
+            return true;
+        }
+        if (key == K_ESC) {
+            g_ui.prompt = g_ui.edit_backup;
+            g_ui.editing = false;
+            invalidate();
+            return true;
+        }
+        if (key == K_BACKSPACE || key == K_DEL) {
+            if (!g_ui.prompt.empty()) {
+                size_t i = g_ui.prompt.size() - 1;
+                while (i > 0 && ((unsigned char) g_ui.prompt[i] & 0xC0) == 0x80) {
+                    --i;
+                }
+                g_ui.prompt.erase(i);
+            }
+            return true;
+        }
+        if (key >= 32 && key < 127) {
+            if (g_ui.prompt.size() < 200) {
+                g_ui.prompt += (char) key;
+            }
+            return true;
+        }
+        return true;
+    }
+
+    if (key == 'q' || key == K_ESC) {
+        return false;
+    }
+    if (key == 'i') {
+        if (!g_ui.job.running) {
+            g_ui.editing = true;
+            g_ui.edit_backup = g_ui.prompt;
+            invalidate();
+        }
+        return true;
+    }
+    if (key == 's' && !g_ui.job.running) {
+        start_inference();
+        return true;
+    }
+    if (key == 'c') {
+        if (g_ui.job.running) {
+            stop_inference();
+        } else {
+            eng.clear_cancel();
+            g_ui.page = page_t::settings;
+            invalidate();
+        }
+        return true;
+    }
+    if (key == K_ENTER && !g_ui.job.running) {
+        start_inference();
+        return true;
+    }
+    return true;
+}
+
+// ===========================================================================
+// TUI main loop
+// ===========================================================================
+
+int run_tui() {
+    diskui::engine & eng = diskui::engine::get();
+
+    // the terminal is only ours after term_enter(); everything below assumes it
+    install_signal_handlers();
+    eng.set_log_sink(route_log);
     llama_log_set(llama_log_cb, nullptr);
     llama_disk::set_msg_cb(disk_msg_cb);
 
-    set_status("loading model ...");
-    paint_all();
+    term_enter();
+    term_size();
+    g_compact = (g_rows < 20 || g_cols < 60);
+    g_narrow  = (g_cols < 60);
+    g_short   = (g_rows < 20);
 
-    g_painter = new std::thread(painter_main);
+    g_ui.prompt = g_cli.prompt;
+    g_ui.sysmsg = g_cli.sysmsg;
+    g_ui.temp   = g_cli.temp;
+    g_ui.moe    = g_cli.moe;
+    g_ui.chat   = g_cli.chat;
+    g_ui.n_ctx  = g_cli.n_ctx;
 
-    logf("diskinfer  %s", o.model.c_str());
-    logf("ctx %d  prefill ub %d  threads %d  temp %.2f  top_k %d  top_p %.2f  single turn",
-         o.n_ctx, o.n_ubatch, o.n_threads, o.temp, o.top_k, o.top_p);
+    int rc = 0;
 
-    llama_backend_init();
-
-    const int64_t t_start = now_ms();
-
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
-
-    // check the file before handing it to the loader: a bad path would crash inside
-    // llama.cpp's error path instead of reporting anything useful
-    {
-        FILE * f = fopen(o.model.c_str(), "rb");
-        if (f == nullptr) {
-            logf("! cannot open '%s'", o.model.c_str());
-            paint_all();
-            tui_exit(1);
+    if (!g_cli.model.empty()) {
+        // the launcher pinned the model: load it and go straight to settings
+        g_ui.model_path  = g_cli.model;
+        g_ui.model_fixed = true;
+        g_ui.models      = scan_models();
+        if (!load_selected_model()) {
+            rc = 1;
         }
-        char magic[4] = { 0, 0, 0, 0 };
-        const size_t n = fread(magic, 1, 4, f);
-        fclose(f);
-        if (n != 4 || memcmp(magic, "GGUF", 4) != 0) {
-            logf("! '%s' is not a GGUF file", o.model.c_str());
-            paint_all();
-            tui_exit(1);
-        }
-    }
-
-    llama_model * model = nullptr;
-    try {
-        model = llama_model_load_from_file(o.model.c_str(), mp);
-    } catch (const std::exception & e) {
-        logf("! %s", e.what());
-    } catch (...) {
-        logf("! model load threw");
-    }
-    if (model == nullptr) {
-        logf("! model load failed");
-        paint_all();
-        tui_exit(1);
-    }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
-    {
-        char desc[512];
-        llama_model_desc(model, desc, sizeof(desc));
-        logf("[%5.1fs] model ready: %s", (now_ms() - t_start) / 1000.0, desc);
-        logf("size %.2f GiB  params %.2f B  n_layer %d  n_embd %d  n_ctx_train %d",
-             llama_model_size(model) / 1073741824.0,
-             llama_model_n_params(model) / 1e9,
-             llama_model_n_layer(model),
-             llama_model_n_embd(model),
-             llama_model_n_ctx_train(model));
-        logf("vocab %u tokens  rss %ld MiB",
-             llama_vocab_n_tokens(vocab), rss_kb() / 1024);
-    }
-
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx      = o.n_ctx;
-    cp.n_batch    = o.n_ubatch;
-    cp.n_ubatch   = o.n_ubatch;
-    cp.n_threads  = o.n_threads;
-    cp.n_threads_batch = o.n_threads;
-    cp.no_perf    = false;
-
-    llama_context * ctx = llama_init_from_model(model, cp);
-    if (ctx == nullptr) {
-        logf("! context creation failed");
-        paint_all();
-        tui_exit(1);
-    }
-    logf("[%5.1fs] context ready  rss %ld MiB", (now_ms() - t_start) / 1000.0, rss_kb() / 1024);
-    set_status("ready. type a question, Enter to run");
-    paint_all();
-
-    // samplers: top_k -> top_p -> temp -> dist
-    auto sp = llama_sampler_chain_default_params();
-    llama_sampler * smpl = llama_sampler_chain_init(sp);
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(o.top_k));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(o.top_p, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(o.temp));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    llama_batch batch = llama_batch_init(o.n_ubatch, 0, 1);
-
-    // ------------------------------------------------ one single turn
-    std::string q = o.question;
-
-    for (;;) {
-        if (q.empty()) {
-            set_status("type a question, Enter to run  (Ctrl-C to quit)");
-            g_a.clear();
-            paint_all();
-
-            // let the terminal echo the input on the Q row
-            out("\x1b[%d;1H\x1b[2KQ: \x1b[?25h", LOG_ROWS + 1);
-            fflush(stdout);
-
-            char line[1024];
-            if (fgets(line, sizeof(line), stdin) == nullptr) {
-                break;
+    } else {
+        g_ui.models = scan_models();
+        if (g_ui.models.empty()) {
+            g_ui.page = page_t::model;
+        } else if (g_ui.models.size() == 1) {
+            g_ui.model_path = g_ui.models[0].path;
+            if (!load_selected_model()) {
+                rc = 1;
             }
-            out("\x1b[?25l");
-            q = line;
-            while (!q.empty() && (q.back() == '\n' || q.back() == '\r')) {
-                q.pop_back();
-            }
-            if (q.empty()) {
-                continue;
-            }
-        }
-
-        g_q = q;
-        g_a.clear();
-        set_status("preparing ...");
-        paint_all();
-
-        logf("---- turn ----");
-        logf("prompt: %s", q.c_str());
-
-        // raw completion by default for base style checkpoints, chat template with --chat
-        std::string prompt;
-        if (o.raw) {
-            prompt = q;
         } else {
-            prompt = "";
-            if (!o.sysmsg.empty()) {
-                prompt += "<|im_start|>system\n" + o.sysmsg + "<|im_end|>\n";
-            }
-            prompt += "<|im_start|>user\n" + q + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+            g_ui.page = page_t::model;
         }
-        logf("prompt mode: %s", o.raw ? "raw completion" : "chat template (thinking off)");
-
-        const int n_prompt = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), nullptr, 0, true, true);
-        if (n_prompt <= 0) {
-            logf("! tokenize failed");
-            q.clear();
-            continue;
-        }
-        if (n_prompt + o.n_predict >= o.n_ctx) {
-            o.n_predict = std::max(1, o.n_ctx - n_prompt - 1);
-            logf("ctx full: n_predict limited to %d", o.n_predict);
-        }
-
-        std::vector<llama_token> toks(n_prompt);
-        if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), toks.data(), toks.size(), true, true) < 0) {
-            logf("! tokenize failed");
-            q.clear();
-            continue;
-        }
-
-        logf("prompt = %d tokens  (%s)", n_prompt, o.raw ? "raw completion" : "chat template, thinking off");
-
-        // context is cleared for every turn: single turn only
-        llama_memory_clear(llama_get_memory(ctx), true);
-
-        int n_past = 0;
-        int64_t t_pp0 = now_ms();
-        int64_t io_pp = 0;
-
-        set_status("prompt processing ...");
-        paint_all();
-
-        for (int i = 0; i < n_prompt; i += o.n_ubatch) {
-            const int n = std::min(o.n_ubatch, n_prompt - i);
-
-            batch.n_tokens = n;
-            for (int j = 0; j < n; ++j) {
-                batch.token[j]    = toks[i + j];
-                batch.pos[j]      = i + j;
-                batch.n_seq_id[j] = 1;
-                batch.seq_id[j][0] = 0;
-                batch.logits[j]   = (i + j == n_prompt - 1);
-            }
-
-            char piece[256] = {0};
-            int np = llama_token_to_piece(vocab, toks[i], piece, sizeof(piece), 0, false);
-            if (np <= 0) {
-                snprintf(piece, sizeof(piece), "#%d", (int) toks[i]);
-                np = (int) strlen(piece);
-            }
-
-            llama_disk::llama_disk_stats s0, s1;
-            llama_disk::get_stats(&s0);
-            const int64_t t0 = now_ms();
-
-            live_begin("pp", i + 1, n_prompt, piece);
-            const int rc = llama_decode(ctx, batch);
-            live_end();
-
-            const int64_t t1 = now_ms();
-            llama_disk::get_stats(&s1);
-
-            const double io_s = (s1.io_us - s0.io_us) / 1e6;
-            const double tot_s = (t1 - t0) / 1000.0;
-            io_pp += (int64_t) (s1.io_us - s0.io_us);
-
-            if (rc != 0) {
-                logf("! decode failed at %d (rc %d)", i, rc);
-                break;
-            }
-
-            logf("[%s] pp %d-%d/%d  io %.1fs  cmp %.1fs  '%.*s'",
-                 fmt_clock(t1 - t_pp0).c_str(), i + 1, i + n, n_prompt,
-                 io_s, tot_s - io_s, np, piece);
-
-            n_past = i + n;
-        }
-
-        const int64_t t_pp1 = now_ms();
-        const double pp_s = (t_pp1 - t_pp0) / 1000.0;
-        logf("[%s] prompt done: %d tok in %.1fs (%.1f s/tok), io %.1fs",
-             fmt_clock(t_pp1 - t_pp0).c_str(), n_prompt, pp_s, pp_s / n_prompt, io_pp / 1e6);
-        paint_all();
-
-        // ------------------------------------------------ generation
-        const int64_t t_gen0 = now_ms();
-        int n_gen = 0;
-        int64_t io_gen = 0;
-
-        for (int step = 0; step < o.n_predict; ++step) {
-            const int64_t t0 = now_ms();
-            const llama_token tok = llama_sampler_sample(smpl, ctx, -1);
-
-            if (llama_vocab_is_eog(vocab, tok)) {
-                logf("[%s] eog after %d tokens", fmt_clock(now_ms() - t_gen0).c_str(), n_gen);
-                break;
-            }
-
-            char piece[256] = {0};
-            int np = llama_token_to_piece(vocab, tok, piece, sizeof(piece), 0, true);
-            if (np < 0) {
-                np = 0;
-            }
-            g_a.append(piece, np);
-            paint_all();
-
-            if (n_past + 1 >= o.n_ctx) {
-                logf("ctx full at %d tokens", n_gen + 1);
-                break;
-            }
-
-            batch.n_tokens = 1;
-            batch.token[0] = tok;
-            batch.pos[0]   = n_past;
-            batch.n_seq_id[0] = 1;
-            batch.seq_id[0][0] = 0;
-            batch.logits[0] = 1;
-            n_past++;
-
-            llama_disk::llama_disk_stats s0, s1;
-            llama_disk::get_stats(&s0);
-
-            live_begin("t", n_gen + 1, o.n_predict, piece);
-            const int rc = llama_decode(ctx, batch);
-            live_end();
-
-            const int64_t t1 = now_ms();
-            llama_disk::get_stats(&s1);
-
-            const double io_s = (s1.io_us - s0.io_us) / 1e6;
-            const double tot_s = (t1 - t0) / 1000.0;
-            io_gen += (int64_t) (s1.io_us - s0.io_us);
-            n_gen++;
-
-            if (rc != 0) {
-                logf("! decode failed at token %d (rc %d)", n_gen, rc);
-                break;
-            }
-
-            logf("[%s] t%-3d io %5.1fs  cmp %5.1fs  tot %5.1fs  %s",
-                 fmt_clock(t1 - t_gen0).c_str(), n_gen, io_s, tot_s - io_s, tot_s,
-                 ("'" + std::string(piece, np) + "'").c_str());
-
-            set_status("generating ... (Ctrl-C to stop)");
-        }
-
-        const int64_t t_gen1 = now_ms();
-        const double gen_s = (t_gen1 - t_gen0) / 1000.0;
-
-        logf("---- done ----");
-        logf("gen %d tok in %.1fs (%.1f s/tok)  io %.1fs  rss %ld MiB",
-             n_gen, gen_s, n_gen > 0 ? gen_s / n_gen : 0.0, io_gen / 1e6, rss_kb() / 1024);
-
-        // full answer wrapped into the log so it stays readable
-        logf("answer: %s", g_a.c_str());
-
-        {
-            const char * home = getenv("HOME");
-            if (home != nullptr) {
-                std::string p = std::string(home) + "/last_answer.txt";
-                if (FILE * fa = fopen(p.c_str(), "w")) {
-                    fputs(g_a.c_str(), fa);
-                    fclose(fa);
-                    logf("saved to %s", p.c_str());
-                }
-            }
-        }
-
-        set_status("done. Enter for a new question (context cleared), Ctrl-C to quit");
-        paint_all();
-
-        if (!o.question.empty()) {
-            break; // one shot mode
-        }
-        q.clear();
     }
 
-    llama_batch_free(batch);
-    llama_sampler_free(smpl);
-    llama_free(ctx);
-    llama_model_free(model);
+    if (g_cli.api) {
+        // -api: start the server once the model is loaded
+        set_api_enabled(true);
+    }
 
-    tui_exit(0);
+    int last_rows = g_rows;
+    int last_cols = g_cols;
+
+    while (!g_signal && rc == 0) {
+
+        term_size();
+        if (g_rows != last_rows || g_cols != last_cols) {
+            last_rows = g_rows;
+            last_cols = g_cols;
+            invalidate();
+        }
+
+        poll_generation();
+        switch (g_ui.page) {
+            case page_t::model:
+                paint_frame(frame_model_picker());
+                break;
+            case page_t::settings:
+                paint_frame(frame_settings());
+                break;
+            case page_t::run:
+                paint_frame(frame_run());
+                break;
+        }
+
+        const int key = read_key(150);
+        if (key == K_NONE) {
+            continue;
+        }
+
+        bool keep = true;
+        switch (g_ui.page) {
+            case page_t::model:    keep = handle_model_picker(key); break;
+            case page_t::settings: keep = handle_settings(key);     break;
+            case page_t::run:      keep = handle_run(key);          break;
+        }
+        if (!keep) {
+            break;
+        }
+    }
+
+    // ---- shutdown --------------------------------------------------------
+    if (g_ui.job.running) {
+        g_cancel_in_progress.store(true);
+        eng.request_cancel();
+        for (int i = 0; i < 400 && !g_ui.job.done.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        diskui::gen_result r;
+        g_ui.job.join_and_collect(r);
+    }
+    g_api.stop();
+    g_ui.api_on = false;
+
+    llama_log_set(nullptr, nullptr);
+    llama_disk::set_msg_cb(nullptr);
+    eng.unload();
+
+    invalidate();
+    term_leave();
+    return rc;
+}
+
+// ===========================================================================
+// headless API mode
+// ===========================================================================
+
+int run_api_only() {
+    g_headless = true;
+    install_signal_handlers();
+#if !defined(_WIN32)
+    // glibc accepts size 0 for line buffering; msVCRT does not (fast fail), and
+    // the headless log already flushes after every line
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
+
+    diskui::engine & eng = diskui::engine::get();
+    eng.set_log_sink([](const std::string & s) {
+        fputs(s.c_str(), stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+    });
+    // same filter as the TUI: keep errors and the disk engine status, drop the
+    // loader / graph dump chatter
+    llama_log_set(llama_log_cb, nullptr);
+
+    auto say = [](const std::string & s) {
+        fputs(s.c_str(), stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+    };
+    say(i18n::trf("aonly.banner_fmt", current_pid()));
+
+    std::string model_path = g_cli.model;
+    if (model_path.empty()) {
+        const std::vector<model_entry> models = scan_models();
+        if (!models.empty()) {
+            model_path = models[0].path;
+            say(i18n::trf("aonly.use_first_fmt", models[0].name.c_str()));
+        } else {
+            std::string dirs;
+            for (const auto & d : model_dirs()) {
+                if (!dirs.empty()) {
+                    dirs += " ";
+                }
+                dirs += d;
+            }
+            say(i18n::tr("aonly.no_model_dirs") + dirs);
+            say(i18n::tr("aonly.no_model_note"));
+        }
+    }
+
+    bool have_model = false;
+    if (!model_path.empty()) {
+        std::string err;
+        have_model = eng.load(model_path, g_cli.moe, err);
+        if (!have_model) {
+            say(i18n::trf("aonly.load_failed_fmt", err.c_str()));
+            say(i18n::tr("aonly.continue_fmt"));
+        }
+    }
+
+    diskui::api::options opt;
+    opt.port      = g_cli.port;
+    opt.n_ctx     = std::max(16, g_cli.n_ctx_set ? g_cli.n_ctx : 256);
+    opt.n_predict = g_cli.n_predict;
+    opt.n_threads = g_cli.n_threads;
+    opt.n_ubatch  = g_cli.n_ubatch;
+    opt.temp      = g_cli.temp;
+    opt.top_k     = g_cli.top_k;
+    opt.top_p     = g_cli.top_p;
+
+    std::string err;
+    if (!g_api.start(opt, err)) {
+        say("! " + err);
+        eng.unload();
+        return 1;
+    }
+
+    say(i18n::trf("aonly.listening_fmt", opt.port));
+    say(i18n::trf("aonly.model_fmt",
+                  have_model ? eng.basename().c_str() : std::string(i18n::tr("common.none")).c_str()));
+    say(i18n::trf("aonly.ctx_fmt", opt.n_ctx, opt.n_predict, opt.n_threads, opt.n_ubatch,
+                  opt.temp));
+    say(i18n::tr("aonly.endpoints"));
+    say(i18n::trf("aonly.stop_fmt", current_pid()));
+
+    while (g_signal == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    say(i18n::trf("aonly.signal_fmt", (int) g_signal));
+    g_api.stop();
+    eng.unload();
+    say(i18n::tr("aonly.bye"));
+    return 0;
+}
+
+// ===========================================================================
+// usage / main
+// ===========================================================================
+
+void print_usage() {
+    fputs(i18n::tr("help.body"), stdout);
+}
+
+bool parse_args(int argc, char ** argv) {
+    auto need = [&](int & i) -> const char * {
+        return (i + 1 < argc) ? argv[++i] : nullptr;
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-h" || a == "--help") {
+            g_cli.help = true;
+        } else if (a == "-m" && i + 1 < argc) {
+            g_cli.model = argv[++i];
+        } else if (a == "--api-only") {
+            g_cli.api_only = true;
+        } else if (a == "--api") {
+            g_cli.api = true;
+        } else if (a == "--moe") {
+            g_cli.moe = true;
+        } else if (a == "--chat") {
+            g_cli.chat = true;
+        } else if (a == "--raw") {
+            g_cli.chat = false;
+        } else if (a == "--sys" && i + 1 < argc) {
+            g_cli.sysmsg = argv[++i];
+        } else if (a == "-q" && i + 1 < argc) {
+            g_cli.prompt = argv[++i];
+            g_cli.prompt_set = true;
+        } else if (a == "--prompt" && i + 1 < argc) {
+            g_cli.prompt = argv[++i];
+            g_cli.prompt_set = true;
+        } else if ((a == "-c" || a == "--n-ctx") && i + 1 < argc) {
+            g_cli.n_ctx = atoi(argv[++i]);
+            g_cli.n_ctx_set = true;
+        } else if ((a == "-n" || a == "--n-predict") && i + 1 < argc) {
+            g_cli.n_predict = atoi(argv[++i]);
+        } else if ((a == "-t" || a == "--threads") && i + 1 < argc) {
+            g_cli.n_threads = atoi(argv[++i]);
+        } else if ((a == "-ub" || a == "--ubatch") && i + 1 < argc) {
+            g_cli.n_ubatch = std::max(1, atoi(argv[++i]));
+        } else if (a == "--temp" && i + 1 < argc) {
+            g_cli.temp = (float) atof(argv[++i]);
+        } else if (a == "--top-k" && i + 1 < argc) {
+            g_cli.top_k = atoi(argv[++i]);
+        } else if (a == "--top-p" && i + 1 < argc) {
+            g_cli.top_p = (float) atof(argv[++i]);
+        } else if (a == "--port" && i + 1 < argc) {
+            g_cli.port = atoi(argv[++i]);
+        } else if (a == "--arena" && i + 1 < argc) {
+            const int mb = atoi(argv[++i]);
+            if (mb > 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%d", mb);
+#if defined(_WIN32)
+                _putenv_s("LLAMA_DISK_STREAM_MB", buf);
+#else
+                setenv("LLAMA_DISK_STREAM_MB", buf, 1);
+#endif
+            }
+        } else if (a == "--debug") {
+#if defined(_WIN32)
+            _putenv_s("LLAMA_DISK_DEBUG", "1");
+#else
+            setenv("LLAMA_DISK_DEBUG", "1", 1);
+#endif
+        } else if (a == "--api-ctx" && i + 1 < argc) {
+            g_cli.n_ctx = atoi(argv[++i]);
+            g_cli.n_ctx_set = true;
+        } else if (!a.empty() && a[0] != '-') {
+            g_cli.prompt = a;
+            g_cli.prompt_set = true;
+            // swallow the rest as part of the prompt, like the old TUI did
+            for (++i; i < argc; ++i) {
+                g_cli.prompt += " ";
+                g_cli.prompt += argv[i];
+            }
+            --i;
+        } else {
+            fprintf(stderr, "%s\n", i18n::trf("misc.unknown_arg_fmt", a.c_str()).c_str());
+        }
+    }
+    (void) need;
+    return true;
+}
+
+int run_cli_fallback() {
+    // called when stdin/stdout is not a terminal: never paint escape codes into a
+    // pipe, explain what to do instead and exit with a distinct code
+    fputs(i18n::tr("misc.no_tty"), stderr);
+    return 2;
+}
+
+} // namespace
+
+// ===========================================================================
+// entry point
+// ===========================================================================
+
+int main(int argc, char ** argv) {
+#if defined(_WIN32)
+    // utf-8 console for the CLI / headless output, restored at exit
+    win_console_enter();
+    atexit(win_console_leave);
+#endif
+    // --lang is parsed and removed here, so the rest of the program (help, usage,
+    // TUI and log text) is already in the right language
+    i18n::init(argc, argv);
+    int argc_eff = 0;
+    while (argc_eff < argc && argv[argc_eff] != nullptr) {
+        ++argc_eff;
+    }
+    parse_args(argc_eff, argv);
+
+    if (g_cli.help) {
+        print_usage();
+        return 0;
+    }
+    if (g_cli.n_ctx < 3) {
+        g_cli.n_ctx = 3;
+    }
+    if (g_cli.n_predict < 1) {
+        g_cli.n_predict = 1;
+    }
+    if (g_cli.n_threads < 1) {
+        g_cli.n_threads = 1;
+    }
+    if (g_cli.n_ubatch < 1) {
+        g_cli.n_ubatch = 1;
+    }
+    if (g_cli.temp < 0.0f) {
+        g_cli.temp = 0.0f;
+    }
+    if (g_cli.temp > 1.0f) {
+        g_cli.temp = 1.0f;
+    }
+
+    if (g_cli.api_only) {
+        return run_api_only();
+    }
+
+    if (!tty_available()) {
+        return run_cli_fallback();
+    }
+
+    try {
+        return run_tui();
+    } catch (const std::exception & e) {
+        term_leave();
+        fprintf(stderr, "%s\n", i18n::trf("misc.fatal_fmt", e.what()).c_str());
+        return 1;
+    } catch (...) {
+        term_leave();
+        fprintf(stderr, "%s\n", i18n::tr("misc.fatal_unknown"));
+        return 1;
+    }
 }

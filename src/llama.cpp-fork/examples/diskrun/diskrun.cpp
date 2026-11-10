@@ -1,5 +1,14 @@
 // minimal driver for the disk-streaming experiment: no common/ dependencies, prints RSS as it goes
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#endif
+
 #include "llama.h"
 #include "ggml-cpu.h"
 
@@ -12,11 +21,19 @@
 
 #if !defined(_WIN32)
 #include <unistd.h>
+#else
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 #endif
 
 static long rss_kb() {
 #if defined(_WIN32)
-    return 0;
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return -1;
+    }
+    return (long) (pmc.WorkingSetSize / 1024);
 #else
     FILE * f = fopen("/proc/self/statm", "r");
     if (!f) {
@@ -39,6 +56,11 @@ static void print_rss(const char * tag) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
+#if defined(_WIN32)
+    // generated pieces are raw utf-8; a legacy console code page would mangle them
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+
     std::string model_path;
     std::string prompt     = "Hello";
     int n_predict          = 16;
@@ -47,6 +69,7 @@ int main(int argc, char ** argv) {
     int n_ubatch           = 1;
     int n_threads          = 4;
     int ngl                = 0;
+    bool extra_bufts       = true;   // repack bufts (off in disk-streaming mode)
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -63,6 +86,10 @@ int main(int argc, char ** argv) {
         else if (a == "-ub")      { n_ubatch  = next(n_ubatch); }
         else if (a == "-t")       { n_threads = next(n_threads); }
         else if (a == "-ngl")     { ngl       = next(ngl); }
+        // native comparison on the desktop: the disk-streaming load path disables the extra
+        // (repack) buffer types, so the non-streaming baseline has to be taken with them
+        // disabled as well for a fair greedy token comparison
+        else if (a == "-no-extra-bufts" || a == "--no-extra-bufts") { extra_bufts = false; }
         else if (a == "-p")       { if (i + 1 < argc) prompt = argv[++i]; }
         else if (a == "--prompt-tokens") {
             // remaining args are token ids
@@ -89,7 +116,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s -m model.gguf [-n n_predict] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [-t threads] [prompt]\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf [-n n_predict] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [-t threads] [-ngl n_gpu_layers] [-no-extra-bufts] [prompt]\n", argv[0]);
         return 1;
     }
 
@@ -102,6 +129,12 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    // The disk-streaming load path disables the extra buffer types (weight
+    // repacking: Q4_K/Q8_0 tensors get a platform-specific 8x4/16x1 layout),
+    // so the native mmap path can be run with the same layout via
+    // -no-extra-bufts for a fair greedy token comparison. The default keeps
+    // upstream behaviour (extra bufts enabled).
+    mparams.use_extra_bufts = extra_bufts;
 
     const int64_t t_load = ggml_time_us();
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
@@ -109,7 +142,13 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "diskrun: failed to load model\n");
         return 1;
     }
-    fprintf(stderr, "diskrun: model loaded in %.1f s\n", (ggml_time_us() - t_load) / 1e6);
+    // the loader disables the extra buffer types (weight repacking) whenever the
+    // disk-streaming path is active, so report the effective state as well
+    const char * env_stream = getenv("LLAMA_DISK_STREAM_MB");
+    const bool disk_stream_mode = env_stream == nullptr || atoi(env_stream) > 0;
+    const bool repack_active = extra_bufts && !disk_stream_mode;
+    fprintf(stderr, "diskrun: model loaded in %.1f s (extra bufts requested = %d, repack active = %d)\n",
+            (ggml_time_us() - t_load) / 1e6, extra_bufts ? 1 : 0, repack_active ? 1 : 0);
     print_rss("after model load");
 
     const llama_vocab * vocab = llama_model_get_vocab(model);

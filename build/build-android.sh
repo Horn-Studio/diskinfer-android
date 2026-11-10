@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# cross compile the diskinfer fork for android (static, arm64 + armv7)
+# cross compile the diskinfer fork for android (static: x86_64 + arm64 + armv7)
 #
-#   NDK=/path/to/android-ndk ./build-android.sh              # both abis
-#   NDK=... ./build-android.sh arm64-v8a                    # one abi
+#   NDK=/path/to/android-ndk ./build-android.sh              # all abis
+#   NDK=... ./build-android.sh x86_64                        # one abi
+#   NDK=... ./build-android.sh arm64-v8a
 #
 # source defaults to ../src/llama.cpp-fork (already patched, nothing to apply)
-# output: ./out/<abi>/{disktui,llama-completion}
+# output: ./out/<abi>/{disktui,diskrun,llama-completion}
+# the windows host equivalent is build/build-android.ps1 (keep the two in sync).
 set -e
 
 NDK=${NDK:-${ANDROID_NDK_HOME:-}}
@@ -30,7 +32,7 @@ fi
 build_abi() {
   ABI=$1
   case "$ABI" in
-    arm64-v8a)
+    arm64-v8a|x86_64)
       CFLAGS="-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE"
       ;;
     armeabi-v7a)
@@ -38,7 +40,7 @@ build_abi() {
       CFLAGS="-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -mfpu=neon-vfpv4 -mfloat-abi=softfp"
       ;;
     *)
-      echo "unknown abi $ABI" >&2
+      echo "unknown abi $ABI (use x86_64, arm64-v8a or armeabi-v7a)" >&2
       return 1
       ;;
   esac
@@ -53,17 +55,20 @@ build_abi() {
     -DCMAKE_EXE_LINKER_FLAGS="-static" -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=OFF \
-    -DLLAMA_CURL=OFF -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF
+    -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
+    -DGGML_OPENMP=OFF -DGGML_NATIVE=OFF -DGGML_LLAMAFILE=OFF \
+    -DDISKINFER_UI_VERSION=1.0.1
 
-  cmake --build "$BUILD" --target llama-diskui llama-completion -j "$JOBS"
+  cmake --build "$BUILD" --target llama-diskui llama-diskrun llama-completion -j "$JOBS"
 
   mkdir -p "$OUT/$ABI"
   cp "$BUILD/bin/llama-diskui"     "$OUT/$ABI/disktui"
+  cp "$BUILD/bin/llama-diskrun"    "$OUT/$ABI/diskrun"
   cp "$BUILD/bin/llama-completion" "$OUT/$ABI/llama-completion"
 
-  # the release binaries are stripped: 52 MB -> 4.6 MB, 132 MB -> 7.5 MB
+  # the release binaries are stripped: 52 MB -> ~4.6 MB, 132 MB -> ~7.5 MB
   if [ -n "$STRIP" ] && [ -x "$STRIP" ]; then
-    "$STRIP" --strip-all "$OUT/$ABI/disktui" "$OUT/$ABI/llama-completion"
+    "$STRIP" --strip-all "$OUT/$ABI/disktui" "$OUT/$ABI/diskrun" "$OUT/$ABI/llama-completion"
   fi
 
   ls -la "$OUT/$ABI"
@@ -72,6 +77,7 @@ build_abi() {
 if [ -n "$1" ]; then
   build_abi "$1"
 else
+  build_abi x86_64
   build_abi arm64-v8a
   build_abi armeabi-v7a
 fi

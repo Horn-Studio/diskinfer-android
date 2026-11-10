@@ -1,201 +1,134 @@
-# diskinfer-android - 在Android设备上运行远大于可用内存的 GGUF 模型
+# diskinfer Android（1.0.1）
 
-这是一个基于llama.cpp修改而生的项目，在使用diskinfer推理模型时，权重全程留在硬盘，不依靠系统的swap和mmap，推理时按计算图节点把张量读进一块固定大小的内存arena，在使用完后即按 LRU 换出。代价是每个 token 都要把模型读一遍，运行速度绝对正比于磁盘读速度。正因如此，设备可运行的最大模型取决于该模型的最大单张量/层大小
+## 更新内容
 
+### Android 功能
 
-此项目包含了一个 `disktui` 用于在termux进行可视化输出
+- **磁盘流式推理**：权重不 mmap、不整体读入内存，按计算图节点 `pread` 进固定大小 arena，用完按 LRU 换出；
+  arena 能装下整个模型时，第一个 token 之后就没有 IO。
+  arena 由 `LLAMA_DISK_STREAM_MB` 控制，TUI 设置页里也能改。
+- **MoE 快速推理**：`MUL_MAT_ID` 节点只读取 router 选中的专家切片，其余专家权重不读盘；
+  设置页 `MoE 快速路径` 开关或 `LLAMA_DISK_MOE=1`（默认关）。
+  实测 Qwen3.5-0.8B-MoE（28 experts / top-12）`nodes=762 experts=10668 fallbacks=0`，
+  贪心 token 与整张量加载逐 token 一致。
+- **新 TUI（`diskinfer` 直接进入）**：
+  - 模型选择页：自动扫描模型目录、显示大小、同名模型去重；`r` 重新扫描。
+  - 设置页：上下文长度（3 … 模型上限，默认 16）、温度（0–1，默认 0.70）、聊天模板（默认关，
+    开启时 ctx 自动变成 `16 + 模板额外 token 数`，之后可改）、MoE 快速路径（默认关）、
+    **内存池 (MB)**（128–2048，`0 = 自动`）、API 服务（默认关，开启后提示 `http://127.0.0.1:4000/v1`）。
+  - 运行页：Prompt / Progress（prefill 进度条、生成 tok/s、io/cmp、累计读盘、换出）/ Answer / Log；
+    提示词默认为空、由用户输入；底部固定按键说明 `s=开始推理  c=取消/返回  q=退出  i=编辑提示词`。
+  - 小屏适配：行数 < 20 或列数 < 60 自动紧凑布局（900×1600 手机 + Termux 40×55 实测）。
+- **本机 `/v1` API（4000 端口）**：无鉴权；`GET /v1/models` 返回模型文件名，`POST /v1/chat/completions`、
+  `POST /v1/completions`、`GET /health`；**同时只跑一个推理，忙时 HTTP 429**；`--api-only` 可无 TUI 常驻。
+- **安装器（自适应 root / 非 root）**：
+  - 电脑上运行：问 adb 路径（支持拖入/引号/纯 `adb`）；root → 推 `/data/local/tmp/llm/` 并 `su` 安装，
+    非 root → 推 `/sdcard/Download/diskinfer/` 并打印 Termux 一行命令。
+  - Termux 内运行：直接装到 `~/llm/` + `$PREFIX/bin`。
+  - root 额外装 oom 保护 / 开机脚本；非 root 不设。无模型时按 root / 非 root 分别提示模型放置路径。
+  - 包与安装脚本全扁平布局，`setup.sh` 也兼容旧的 `device/` 布局并自动挪平。
+- **三个 ABI 包**：`x86_64`（模拟器/ChromeOS）、`arm64-v8a`（手机/平板）、`armeabi-v7a`（32 位老设备）。
+- **多语言**：TUI / 启动器 / 安装器支持 en / zh-Hans / zh-Hant，按系统语言自动识别
+  （Android `persist.sys.locale` → `ro.product.locale` → `LANG/LC_ALL`，Termux 默认 `LANG` 不会盖过手机语言），
+  `--lang` 或 `DISKINFER_LANG` 可覆盖。
+- **上游基线**：fork 升级到 llama.cpp **v0.9.0（`cd959bae`）**，版本号 `0.9.0-dev`。
 
-```
-测试数据（仅作参考，实际使用效果以自己手机性能而定，此次测试使用Bonsai-27B Q1_0推理）
-设备：小天才电话手表 Z8（高通骁龙429w即Wear4100，839MB内存，arm32设备，arena大小给与176MB）
-  [ 1:28] prompt done: 5 tok in 88.6s (17.7 s/tok), io 37.4s
-  [ 0:29] t1  io 17.7s cmp 11.5s tot 29.2s  ' Paris'
-  [ 0:58] t2  io 17.8s cmp 11.4s tot 29.2s  '.'
-  answer:  Paris.
+### 1.0.1 变化
 
-设备：红米K20 Pro（高通骁龙855，8GB内存，arena大小给与2048MB）
-  [ 0:41] prompt done: 6 tok in 41.8s (7.0 s/tok), io 25.7s
-  [ 0:19] t1  io 12.5s cmp  7.2s tot 19.7s
-```
+- 标题栏版本显示 **`diskinfer 1.0.1`**（原 `v5`）。
+- **不再默认 "Hello" 自动推理**：提示词默认为空，进入运行页时光标直接在 Prompt 区，由用户自己输入。
+- 设置页新增 **内存池 (MB)**；运行页底部按键说明改为显式的 `s=… c=… q=… i=…`。
+- 包内不再附带 README（更新/使用说明单独发布）。
 
-## 默认行为
+## 修复的 bug
 
-`load_tensors()` 不再 mmap、也不全量读入，直接走磁盘 streaming。只有一个开关能关掉：
+1. **安装布局 bug（网上反馈）**：旧 `install.sh` 把 `device/` 推成 `/data/local/tmp/llm/device/…`，
+   而启动器/脚本按扁平路径找 → 装完命令不可用。现在包与安装器全部扁平布局（`setup.sh` 同时兼容
+   旧的 `device/` 布局并自动挪平），安装后逐文件自检。
+2. **MoE 快速路径 3 个 bug**：① ids 是 argsort view、行 stride 含 padding → 按 stride 正确解析；
+   ② qwen35 的 MTP/nextn 层 0-token 空节点被整张量读入并常驻 arena → 跳过空节点；
+   ③ 一次回退后整张量常驻导致 MoE 永久失效 → 改为可回收复用。
+3. **取消显示成错误**：旧版取消后显示 `finish error`，还打 `ggml/llama_decode` 错误日志 →
+   现在显示 `finish cancelled`，只记一行 `[cancel] user cancelled after N tokens`。
+4. **设置跨页/换模型丢失**：ctx、温度、MoE/API 开关会被重置 → 现在会话内保留，超出新模型上限时 clamp 并提示。
+5. **模型列表重复**：同一模型出现在多个目录时重复列出 → 按 basename + 大小去重。
+6. **TUI 排版**：Answer 内容不在 Answer 分区、设置页底部按键行被截断、换模型后日志混在一起 →
+   已修（换模型时插入 `---- model: xxx ----` 分隔行）。
+7. **语言被 Termux 环境覆盖**：检测顺序改为 `persist.sys.locale` → `ro.product.locale` → `LANG/LC_ALL`，
+   Termux 默认的 `LANG=en_US.UTF-8` 不再把中文界面顶成英文。
+8. **设置页选中「内存池」后按 `s` 无效**（1.0.1 修复）：该设置项的处理函数吞掉了后续按键 → 改为落空处理。
+9. **无模型引导缺失**：以前只说"没找到模型" → 现在按 root / 非 root 给出各自放置路径与命令。
+10. **安装后版本号不对**：标题栏原来写死 `v5`/`v4` → 改为构建期 `-DDISKINFER_UI_VERSION` 注入，
+    Android 显示 `diskinfer 1.0.1`。
 
-```
-LLAMA_DISK_STREAM_MB=0      # 回到原生 llama.cpp 行为（mmap / 全量读入）
-```
+## 使用方法
 
+1. **解压**：包名 `diskinfer-1.0.1-<abi>.zip`（按手机选 x86_64 / arm64-v8a / armeabi-v7a）：
+   ```bash
+   adb shell getprop ro.product.cpu.abilist    # 有 arm64-v8a 用 arm64；只有 v7a 用 v7a；x86_64 用 x86_64
+   ```
+2. **安装**：
+   - 电脑 + adb：解压后运行 `install.sh`（Windows 用 `install.ps1`），按提示填/拖入 adb 路径，root/非 root 自动处理。
+   - 手机 Termux：把包拷进手机，`cd` 到解压目录后 `sh install.sh`。
+3. **放模型**：
+   ```bash
+   # 非 root（Termux）：私有目录，永远可读
+   cp /sdcard/Download/xxx.gguf ~/models/
+   # 有 root / adb 直接用
+   adb push xxx.gguf /data/local/tmp/llm/models/
+   # 共享目录（Termux 授权后可读）
+   adb push xxx.gguf /storage/emulated/0/models/
+   ```
+4. **运行**：
+   ```bash
+   diskinfer                    # 打开 TUI
+   diskinfer -m ~/models/xxx.gguf   # 跳过模型选择
+   diskinfer --api-only -m ~/models/xxx.gguf   # 只开 /v1 API（端口 4000）
+   ```
+5. **TUI 操作**：选模型 → 设置页调参数 → 按 `s` 进入运行页 → 按 `i` 输入提示词 → 按 `s` 开始推理；
+   `c` 取消/返回，`q` 退出。
+6. **API 示例**：
+   ```bash
+   adb forward tcp:4000 tcp:4000
+   curl http://127.0.0.1:4000/v1/models
+   curl http://127.0.0.1:4000/v1/chat/completions -H 'Content-Type: application/json' \
+     -d '{"model":"xxx.gguf","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
+   ```
 
-## arena 大小（自动决定）
+## 常用参数 / 环境变量
 
-| 情况 | arena |
+| 项 | 说明 |
 |---|---|
-| `LLAMA_DISK_STREAM_MB` 未设置或 `auto` | **内存总量 / 8**，至少 176 MiB |
-| `LLAMA_DISK_STREAM_MB=N` | N MiB |
-
-分配要求：
-1. **不能小于最大单张量** → 自动抬到 `最大张量 + 24 MiB` 并提示（）
-2. **上限 2048 MiB** → 超出截断
-3. **按可用内存收窄** → `MemAvailable - 220 MiB`，剩下的留给词表 / KV / 计算缓冲
-
-```
-llama-disk: arena 111 MiB cannot hold the largest tensor 'token_embd.weight' (170 MiB), raised to 194 MiB
-llama-disk: streaming weights from disk, arena = 194 MiB (raised to fit the largest tensor), direct io = 1, mlock = 1, prefetch = 0 (lookahead 16)
-```
-
-**关于提速**：arena 小于模型时，因为是顺序扫描 + LRU，命中率≈0，io 时间基本不变（模型大小 ÷ 带宽）。**arena 装得下整个模型时，第一个 token 之后权重就全在内存里**，此时将和llama.cpp原生CPU模式无异
-
-## 快速开始
-更简单地，你可以直接使用Agent工具，将项目地址发给他并为其提供adb工具，AI将自动完成。
------
-下载 Release 里对应你设备架构的包：
-
-```bash
-adb shell getprop ro.product.cpu.abilist
-#   有 arm64-v8a     -> diskinfer-v3-arm64-v8a.zip
-#   只有 armeabi-v7a -> diskinfer-v3-armeabi-v7a.zip
-
-cd 解压出来的目录
-./install.sh
-adb push your-model.gguf /storage/emulated/0/models/
-```
-
-然后在设备的 Termux 里敲 `diskinfer`。详见Release。
-
-## 支持的设备
-
-- **架构**：`arm64-v8a`、`armeabi-v7a`（静态二进制，无 .so 依赖，Android 7+）
-- **root**：推荐但非必须。有 root 会 `su` 设 `oom_score_adj=-1000`（小内存设备必须，否则跑几分钟就被lowmemorykiller杀掉）；
-- **Termux**：用于命令入口；也可以直接 `adb shell` 跑二进制
-- **模型**：任何 llama.cpp 认识的 GGUF，目前仅测试了qwen35架构的模型可以正常运行并读取，MoE模型正在开发，但并不是不可使用，而是速度跟稠密的该模型一样，无实用意义
-
-## 参数
-
-```
-diskinfer                              交互，模型自动找 /storage/emulated/0/models/*.gguf
-diskinfer "The capital of France is"   一次性
-diskinfer -h                           全部参数
-
--m PATH       指定模型
---arena MiB    权重 arena（见上；不指定就自动）
--n N           最多生成多少 token（默认 256）
--c N           上下文（默认 256）
--ub N          prefill 批大小（默认 4；1 = 最省内存、prefill 最慢）
--t N           线程（默认 4，手机上可给 8）
---temp F       温度（默认 1.0）
---top-k N      默认 20        --top-p F   默认 0.95
---raw          裸补全（Bonsai-27B只能适应这个，不然会出现问题）    --chat  套 chat 模板并关掉 thinking
---sys TEXT     --chat 用的 system message
-```
-
-## 界面
-
-```
-+---------------------------------------+
-| [  3.3s] model ready: qwen35 27B Q1_0  |
-| [  3.4s] context ready  rss 217 MiB   |
-| ---- turn ----                        |
-| prompt = 17 tokens (raw completion)   |
-| [ 1:38] pp 1-4/17 io 23.5s cmp 75.3s  |
-| [ 3:15] pp 5-8/17 io 21.9s cmp 55.4s  |
-| Q: The capital of France is           |
-| A: Paris.                             |
-| pp 13/17 ' is' L39 io 12.4s cmp 8.0s  |
-+---------------------------------------+
-```
-
-- 上面 `行数-3` 行：滚动日志（加载细节、每批 prefill、每个生成 token）
-- 下面固定 3 行：`Q:` / `A:`（超长显示尾部）/ 状态行
-- 状态行 250ms 刷新：`<阶段> <第几个>/<总共> '<当前token>' L<当前层> io <本批已读>/<累计> ld<读次数> cmp <已算>`
-- 完整日志写到 `/data/local/tmp/llm/diskinfer.log`（有 root）或 `~/diskinfer.log`
-- 答案另存 `~/last_answer.txt`
-
-## 也能用普通 llama.cpp 的命令行
-
-release 里带了 `llama-completion`，就是本 fork 编译出的标准 llama.cpp 工具，可以直接使用该llama.cpp构建而无需依赖termux
-
-```bash
-./llama-completion -m model.gguf -p "The capital of France is" -n 32 --temp 0.3
-
-# 想回到原生行为（模型能装进内存时，~~但这还有什么意义，你为何不去用原版~~）
-LLAMA_DISK_STREAM_MB=0 ./llama-completion -m model.gguf -p "..." -n 32
-```
-
-chat 模板、sampling 预设、`-cnv` 这些原生功能都能用，只是没有 `disktui` 的分屏和逐 token 计时。
-
-## 原理
-值得注意的是，此项目原本是用作在小天才电话手表上运行Qwen3.8 27B的实验项目，故下面的实现路径与小内存+armv7a设备相匹，armv8设备未做特殊优化，或者说不是该项目的主要受益设备
-
-
-----
-
-llama.cpp 默认要么全量读入内存，要么 mmap 全部。这两种在这类设备上都不可行：
-
-1. **mmap 不行**：32 位进程虚拟地址只有 ~3GB，3.5GB 的模型连映射都做不到
-2. **全量读入不行**：内存装不下
-
-这里走第三条路 —— **`no_alloc` + 节点级按需换入**：
-
-- 用 llama.cpp 的 `no_alloc` 模式加载：只读元数据，权重一个字节都不读，张量拿 dummy buffer
-- 在 ggml CPU 后端的图执行循环里插节点回调（`ggml_cpu_set_node_residency_cb`）
-- 每个节点执行前，把它需要的张量从 gguf 里 `pread` 进 arena（默认 `O_DIRECT` 绕 page cache），
-  执行后解除 pin；arena 满就按 LRU 换出
-- 张量按文件顺序预排序，读盘基本是顺序的
-
-改动的文件（都在 `src/llama.cpp-fork/` 里，已经改好，直接编译）：
-
-| 文件 | 改了什么 |
-|---|---|
-| `src/llama-disk.h` `.cpp` | **新增**，磁盘 streaming 引擎（arena/块分配/LRU/O_DIRECT/诊断） |
-| `examples/diskui/` | **新增**，TUI + 驱动 |
-| `examples/diskrun/` | **新增**，最小驱动（不带 TUI，调试用） |
-| `src/llama-model.cpp` | 磁盘模式：跳过 mmap、`no_alloc`、登记权重张量 |
-| `src/CMakeLists.txt` | 加 `llama-disk.cpp` |
-| `ggml/include/ggml-cpu.h` | 声明 `ggml_cpu_set_node_residency_cb()` |
-| `ggml/src/ggml-cpu/ggml-cpu.c` | 节点执行前后调回调 |
-| `examples/CMakeLists.txt` | 加 `diskui` / `diskrun` |
-
-环境变量：
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `LLAMA_DISK_STREAM_MB` | **开启（auto 定容）** | arena 大小；`0` = 关闭，回到原生 mmap |
-| `LLAMA_DISK_ODIRECT` | 1 | `O_DIRECT`，绕过 page cache；`0` 关掉 |
-| `LLAMA_DISK_MLOCK` | 0 | mlock arena，防 zram 换出（`diskinfer` 默认开） |
-| `LLAMA_DISK_PREFETCH` | 0 | 后台预读线程（实测无收益） |
-| `LLAMA_DISK_LOOKAHEAD` | 16 | 预读看几个张量 |
-| `LLAMA_DISK_VERBOSE` | 0 | 每 4096 次回调打计数 |
-| `LLAMA_DISK_DEBUG` | 0 | 看门狗 + 读盘诊断 |
-| `LLAMA_DISK_WINDOW` | 0 | 行/视图窗口（实验性，有已知死锁） |
-| `LLAMA_DISK_OUT_CHUNK` | 0 | 分块 logits 行数（实验性） |
-| `GGML_CPU_DISABLE_FUSION` | 自动置 1 | 磁盘模式下由 `init()` 设置 |
-
-## 如何自己编译
-
-```bash
-NDK=/path/to/android-ndk ./build/build-android.sh
-```
-
-产物在 `build/out/<abi>/{disktui,llama-completion}`，已 strip。
-源码就是 `src/llama.cpp-fork/`，不需要打任何 patch。
-
-两个坑（脚本里已处理）：
-
-- **armv7 必须手动加 `-mfpu=neon-vfpv4 -mfloat-abi=softfp`**，NDK 的 `ANDROID_ARM_NEON=TRUE`
-  在这个组合下不会真的加 `-mfpu=neon`，漏了就是纯标量，慢 2-3 倍
-- **32 位必须加 `-D_FILE_OFFSET_BITS=64`**，否则 `off_t` 是 32 位，>2GB 的文件连 GGUF magic
-  都读不出来
-
+| `-m PATH` | 指定模型 |
+| `--arena MiB` | 权重 arena（128–2048） |
+| `-c N` / `-n N` | 上下文 / 最大生成 token |
+| `-t N` / `-ub N` | 线程 / prefill 批大小 |
+| `--temp F` | 温度 |
+| `--api-only` | 无 TUI，只开 `/v1` API |
+| `--lang auto\|en\|zh-Hans\|zh-Hant` | 界面语言 |
+| `LLAMA_DISK_STREAM_MB` | arena 大小；`0` = 关闭磁盘流式（回到原生 mmap） |
+| `LLAMA_DISK_MOE` | `1` = MoE 快速路径 |
+| `LLAMA_DISK_ODIRECT` / `LLAMA_DISK_MLOCK` | `O_DIRECT` 读 / mlock arena（默认 1 / 0） |
+| `LLAMA_DISK_VERBOSE` | 统计日志 |
+| `DISKINFER_LANG` | 界面语言覆盖 |
+| `DISKINFER_MODEL_DIRS` | 模型目录（冒号分隔，启动器自动设置） |
 
 ## 已知限制
 
----
+- arena < 模型时，每个 token 都要把模型完整读一遍，速度 ≈ 闪存顺序带宽（加大 arena 不是万能）。
+- 非 root 无法设置 oom 保护，长推理在 1–2 GB 设备上可能被系统回收。
+- armv7（32 位）无法寻址 ≥ 4 GiB 的 GGUF。
+- 桌面平台 native 默认启用 repack，与流式对照时 token 可能与流式不同（浮点累加顺序，不是 bug）；
+  Android 目标构建为 baseline，本机实测一致。
+- `LLAMA_DISK_WINDOW=1` 是既有实验特性，不要与 MoE 组合。
 
-- 每个 token 都要全部遍历一遍模型自身，因此速度绝对由闪存带宽决定（顺序读 150~250MB/s 很常见，但如何老旧的设备算力也是需要时间的）
-- arena < 模型时加大 arena 基本没用（顺序扫描 + LRU 命中率≈0）
-- 小心zram消耗殆尽，这样会导致emmc的读取速度大幅度下降
-- `LLAMA_DISK_WINDOW` / `LLAMA_DISK_OUT_CHUNK` 是实验特性，未经过测试，小arena的情况下会出问题
+## 卸载
 
-
-**欢迎让你的老设备爆发潜力!**
+```bash
+adb shell rm -rf /data/local/tmp/llm /sdcard/Download/diskinfer
+# Termux 内：
+rm -rf ~/llm
+rm -f $PREFIX/bin/diskinfer $PREFIX/bin/termfont
+# root 还要删开机脚本
+adb shell su -c 'rm -f /data/adb/service.d/99-disktui.sh'
+```

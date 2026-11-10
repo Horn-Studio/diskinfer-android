@@ -1,14 +1,82 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # termfont <8..20>   termux terminal font size (smaller = more columns)
+#
+# messages: en / zh-Hans / zh-Hant, auto-detected (contract v5 §1.3):
+#   DISKINFER_LANG > getprop persist.sys.locale > ro.product.locale > $LANG > $LC_ALL
+#
+# ---------------------------------------------------------------------------
+# i18n
+# ---------------------------------------------------------------------------
+lang_from_tag() {
+  tag=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$tag" in
+    *hant*|*tw*|*hk*|*mo*) printf '%s' zh-hant ;;
+    zh*)                   printf '%s' zh-hans ;;
+    *)                     printf '%s' en ;;
+  esac
+}
+
+probe_system_lang() {
+  probe=""
+  # on android the phone's language is the product locale; Termux may export its
+  # own LANG (en_US.UTF-8 by default) which has nothing to do with the device
+  # setting, so the system properties win (same order as the TUI i18n.cpp)
+  if command -v getprop >/dev/null 2>&1; then
+    probe=$(getprop persist.sys.locale 2>/dev/null)
+  elif [ -x /system/bin/getprop ]; then
+    probe=$(/system/bin/getprop persist.sys.locale 2>/dev/null)
+  fi
+  if [ -z "$probe" ]; then
+    if command -v getprop >/dev/null 2>&1; then
+      probe=$(getprop ro.product.locale 2>/dev/null)
+    elif [ -x /system/bin/getprop ]; then
+      probe=$(/system/bin/getprop ro.product.locale 2>/dev/null)
+    fi
+  fi
+  [ -z "$probe" ] && probe=${LANG:-}
+  [ -z "$probe" ] && probe=${LC_ALL:-}
+  printf '%s' "$probe"
+}
+
+detect_lang() {
+  explicit=${1:-}
+  if [ -z "$explicit" ] && [ -n "${DISKINFER_LANG:-}" ]; then
+    explicit=$DISKINFER_LANG
+  fi
+  if [ -z "$explicit" ]; then
+    explicit=$(probe_system_lang)
+  fi
+  lang_from_tag "$explicit"
+}
+
+# t <en> <zh-Hans> <zh-Hant>
+t() {
+  case "$L10N" in
+    zh-hans) printf '%s' "$2" ;;
+    zh-hant) printf '%s' "$3" ;;
+    *)       printf '%s' "$1" ;;
+  esac
+}
+
+msg() {
+  case "$1" in
+    current) printf "$(t 'current: %s\n' '当前字号: %s\n' '目前字號: %s\n')" "$2" ;;
+    usage)   printf "$(t 'usage: termfont 8..20  (smaller = more columns)\n' '用法: termfont 8..20  （数字越小列越多）\n' '用法: termfont 8..20  （數字越小欄越多）\n')" ;;
+    set)     printf "$(t 'font size set to %s, restarting termux ...\n' '字号设为 %s，正在重启 Termux ...\n' '字號設為 %s，正在重新啟動 Termux ...\n')" "$2" ;;
+  esac
+}
+
+L10N=$(detect_lang)
+
 F=/data/data/com.termux/shared_prefs/com.termux_preferences.xml
 if [ -z "$1" ]; then
-  echo "current: $(grep -o 'fontsize">[0-9]*' "$F" 2>/dev/null | cut -d'>' -f2)"
-  echo "usage: termfont 8..20"
+  msg current "$(grep -o 'fontsize">[0-9]*' "$F" 2>/dev/null | cut -d'>' -f2)"
+  msg usage
   exit 0
 fi
 printf "%s\n" "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>" "<map>" "    <int name=\"log_level\" value=\"1\" />" "    <string name=\"fontsize\">$1</string>" "</map>" > "$F"
 chmod 660 "$F" 2>/dev/null
-echo "font size set to $1, restarting termux ..."
+msg set "$1"
 am force-stop com.termux
 sleep 1
 am start -n com.termux/.app.TermuxActivity > /dev/null 2>&1

@@ -1,0 +1,3686 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>diskinfer-android · 原理演示</title>
+
+<script>
+/* ============================================================
+   diskinfer-android 原理演示
+   - 改文案：只动下面的 TEXT
+   - 改节奏：只动 TIMELINE（毫秒）
+   - 调试参数：?t=12  ?speed=1.5  ?loop=1
+   ============================================================ */
+
+// 改这里：全部界面文案。改完刷新即可。
+const TEXT = {
+  docTitle: 'diskinfer-android · 原理演示',
+  stageLabel: 'diskinfer-android 原理演示：权重留在硬盘，按计算图节点换入内存 arena',
+
+  chrome: {
+    brand: 'diskinfer-android',
+    badge: 'GGUF 磁盘流式推理',
+    topStatus: 'no_alloc · mmap off',
+    footerHint: '权重留在硬盘 · 按层换入',
+    timePattern: '{now} / {total}',
+    scenePattern: '{n} / {total}'
+  },
+
+  units: {
+    percent: '%'
+  },
+
+  // 01 约束 0–3s：模型比内存大
+  s1: {
+    no: '01',
+    kicker: '约束',
+    title: '模型装不下',
+    lead: '模型比可用内存大 4 倍',
+    chip: '32 位小内存设备',
+    model: {
+      label: '模型',
+      meta: 'GGUF · 27B Q1_0',
+      value: '3.5',
+      unit: 'GB',
+      track: '3.5 GB',
+      note: '权重全程留在硬盘'
+    },
+    memory: {
+      label: '内存',
+      meta: '32 位进程可用',
+      value: '839',
+      unit: 'MB',
+      track: '可用 839 MB',
+      shortfall: '差 2.7 GB',
+      note: '还要留出 KV / 计算缓冲'
+    },
+    routes: [
+      { title: 'mmap', reason: '地址空间不够', detail: '32 位虚拟地址 ~3 GB' },
+      { title: '全量载入', reason: '内存装不下', detail: '3.5 GB > 839 MB' }
+    ]
+  },
+
+  // 02 核心思路 3–6s：硬盘 → 固定 arena → CPU
+  s2: {
+    no: '02',
+    kicker: '核心思路',
+    title: '权重留在硬盘',
+    lead: '按层换进固定 arena，交给 CPU 计算图',
+    chip: 'no_alloc + 按层换入',
+    disk: { label: '硬盘', name: 'GGUF 权重', value: '3.5 GB', note: '权重原地不动', tag: '只读' },
+    arena: { label: 'RAM', name: 'arena', value: '176 MiB', note: '固定大小 · 示例 176 MiB', tag: '固定预留' },
+    cpu: { label: 'CPU', name: '计算图', value: '逐层', note: '执行后解 pin', tag: '按层' },
+    flowRead: { main: 'pread', sub: 'O_DIRECT' },
+    flowRun: { main: '按层', sub: 'compute' },
+    strip: [
+      { code: 'no_alloc', text: '只读元数据，权重一字节不读', icon: 'i-check-circle' },
+      { code: 'pread', text: '按层把权重读进 arena', icon: 'i-download' },
+      { code: 'O_DIRECT', text: '绕过 page cache', icon: 'i-bolt' }
+    ]
+  },
+
+  // 03 64 层搬运（场景内时间轴见 DEMO3）
+  s3: {
+    no: '03',
+    kicker: '层搬运',
+    title: '64 层，一次只驻留 8 层',
+    lead: '按层搬进 arena，算完换出；每生成一个 token，整个模型重读一遍',
+    chip: '64 层 · arena 8 层',
+
+    io: {
+      qTag: '问',
+      aTag: '答',
+      question: '你是谁',
+      promptTokens: ['你', '是', '谁'],
+      answerTokens: ['我', '是', 'Qwen'],
+      ppLabel: 'pp',
+      tgLabel: 'tg',
+      phaseIdle: '待机',
+      phasePrefill: 'prefill · 1 / 3',
+      phaseDecode: 'decode · {n} / 3',
+      phaseDone: '完成'
+    },
+
+    disk: {
+      label: '磁盘',
+      title: 'GGUF',
+      tag: '64 层',
+      foot: '按文件顺序读 · 3.5 GB'
+    },
+
+    mem: {
+      label: '内存',
+      title: 'arena',
+      tag: '8 层',
+      used: '驻留 {n} / 8 层',
+      evict: 'LRU 换出',
+      note: '只装得下 8 层，下一组到了先换出最久未用'
+    },
+
+    cpu: {
+      label: 'CPU',
+      title: '计算图',
+      tag: '逐层',
+      range: 'L{from} – L{to}',
+      batch: 'batch {n} token',
+      foot: '8 层并行计算',
+      group: '第 {n} / 8 组'
+    },
+
+    kv: {
+      label: 'KV',
+      title: '缓存状态',
+      tag: '6 token',
+      tokens: ['你', '是', '谁', '我', '是', 'Qwen'],
+      foot: '64 层 × 6 token'
+    }
+  },
+
+  // 04 小结
+  s4: {
+    no: '04',
+    kicker: '小结',
+    title: '把权重留在硬盘',
+    lead: '三条原理',
+    items: [
+      { n: '01', text: '权重不占内存', icon: 'i-storage', tone: '' },
+      { n: '02', text: '按层换入 + LRU', icon: 'i-swap', tone: 'secondary' },
+      {
+        n: '03',
+        icon: 'i-speed',
+        tone: 'tertiary',
+        formula: [
+          { text: '速度' },
+          { text: '≈', op: true },
+          { text: '磁盘带宽', tone: 'primary' },
+          { text: '÷', op: true },
+          { text: '模型大小', tone: 'tertiary' }
+        ]
+      }
+    ],
+    close: '内存不再限制模型大小',
+    brand: 'diskinfer-android'
+  }
+};
+
+// 改这里：每段顺序与时长（毫秒）；总时长会自动计算，合计 20000ms。
+const TIMELINE = [
+  { id: 'scene-1', dur: 3000 },  // 约束：模型比内存大
+  { id: 'scene-2', dur: 3000 },  // 核心思路：硬盘 → arena → CPU
+  { id: 'scene-3', dur: 11500 }, // 64 层搬运：8 层驻留 + KV + 3 token
+  { id: 'scene-4', dur: 2500 }   // 小结
+];
+
+</script>
+
+<style>
+/* ============================================================
+   Material Design 3 · dark (baseline purple)
+   Tokens和组件写法对齐 Material You 示例页
+   ============================================================ */
+:root {
+  color-scheme: dark;
+
+  --md-primary: #D0BCFF;
+  --md-on-primary: #381E72;
+  --md-primary-container: #4F378B;
+  --md-on-primary-container: #EADDFF;
+
+  --md-secondary: #CCC2DC;
+  --md-on-secondary: #332D41;
+  --md-secondary-container: #4A4458;
+  --md-on-secondary-container: #E8DEF8;
+
+  --md-tertiary: #EFB8C8;
+  --md-on-tertiary: #492532;
+  --md-tertiary-container: #633B48;
+  --md-on-tertiary-container: #FFD8E4;
+
+  --md-error: #F2B8B5;
+  --md-on-error: #601410;
+  --md-error-container: #8C1D18;
+  --md-on-error-container: #F9DEDC;
+
+  --md-surface: #141218;
+  --md-on-surface: #E6E0E9;
+  --md-surface-variant: #49454F;
+  --md-on-surface-variant: #CAC4D0;
+  --md-surface-dim: #141218;
+  --md-surface-bright: #3B383E;
+  --md-surface-container-lowest: #0F0D13;
+  --md-surface-container-low: #1D1B20;
+  --md-surface-container: #211F26;
+  --md-surface-container-high: #2B2930;
+  --md-surface-container-highest: #36343B;
+  --md-background: #141218;
+  --md-on-background: #E6E0E9;
+  --md-outline: #938F99;
+  --md-outline-variant: #49454F;
+  --md-inverse-surface: #E6E0E9;
+  --md-inverse-on-surface: #322F35;
+  --md-inverse-primary: #6750A4;
+  --md-scrim: #000000;
+  --md-shadow: #000000;
+
+  --font-sans: Roboto, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+
+  --type-headline-small: clamp(14px, 1.7cqw, 36px);
+  --type-title-large: clamp(11px, 1.38cqw, 28px);
+  --type-title-medium: clamp(9px, 1cqw, 21px);
+  --type-body-large: clamp(8px, 1cqw, 20px);
+  --type-body-medium: clamp(7px, .875cqw, 17px);
+  --type-label-large: clamp(7px, .875cqw, 17px);
+  --type-label-medium: clamp(6px, .75cqw, 14px);
+  --type-label-small: clamp(5px, .688cqw, 13px);
+  --type-metric: clamp(30px, 4.8cqw, 96px);
+
+  --shape-xs: clamp(4px, .5cqw, 11px);
+  --shape-sm: clamp(6px, .75cqw, 16px);
+  --shape-md: clamp(8px, 1cqw, 22px);
+  --shape-lg: clamp(12px, 1.75cqw, 36px);
+  --shape-full: 999px;
+
+  --elevation-1: 0 1px 2px rgba(0, 0, 0, .3), 0 1px 3px 1px rgba(0, 0, 0, .15);
+  --elevation-2: 0 2px 6px rgba(0, 0, 0, .25), 0 4px 8px 3px rgba(0, 0, 0, .15);
+
+  --ease-emph: cubic-bezier(.05, .7, .1, 1);
+  --ease-standard: cubic-bezier(.2, 0, 0, 1);
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  place-items: center;
+  background: #0B090E;
+  color: var(--md-on-background);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+#stage {
+  position: relative;
+  width: min(100vw, 177.7778vh);
+  height: min(100vh, 56.25vw);
+  overflow: hidden;
+  container-type: size;
+  background: var(--md-surface);
+  color: var(--md-on-surface);
+}
+
+.svg-sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.md-icon {
+  display: inline-block;
+  width: var(--icon-size, 1.15cqw);
+  height: var(--icon-size, 1.15cqw);
+  min-width: 8px;
+  min-height: 8px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vertical-align: middle;
+}
+
+.md-icon.sm { --icon-size: clamp(9px, .95cqw, 18px); }
+
+/* ============ 顶栏 App bar ============ */
+.topbar {
+  position: absolute;
+  z-index: 30;
+  top: 2.15cqw;
+  left: 4.75cqw;
+  right: 4.75cqw;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5cqw;
+}
+
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: .78cqw;
+  min-width: 0;
+}
+
+.brand-mark {
+  width: 2.8cqw;
+  height: 2.8cqw;
+  min-width: 22px;
+  min-height: 22px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: var(--shape-sm);
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+}
+
+.brand-mark .md-icon {
+  --icon-size: clamp(10px, 1.5cqw, 28px);
+}
+
+.brand-copy {
+  display: flex;
+  flex-direction: column;
+  gap: .1cqw;
+  min-width: 0;
+}
+
+.brand-name {
+  color: var(--md-on-surface);
+  font-size: var(--type-title-medium);
+  line-height: 1.35;
+  font-weight: 500;
+  letter-spacing: .1px;
+  white-space: nowrap;
+}
+
+.brand-badge {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  line-height: 1.35;
+  font-weight: 500;
+  letter-spacing: .2px;
+  white-space: nowrap;
+}
+
+.top-status {
+  display: inline-flex;
+  align-items: center;
+  gap: .48cqw;
+  flex: 0 0 auto;
+  height: 1.95cqw;
+  min-height: 15px;
+  padding: 0 .8cqw;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-xs);
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  letter-spacing: .2px;
+  white-space: nowrap;
+}
+
+.top-status .md-icon { color: var(--md-primary); }
+
+.live-dot {
+  width: .38cqw;
+  height: .38cqw;
+  min-width: 5px;
+  min-height: 5px;
+  border-radius: 50%;
+  background: var(--md-primary);
+  flex: 0 0 auto;
+}
+
+/* ============ 中间画布 / 场景 ============ */
+.scenes {
+  position: absolute;
+  z-index: 10;
+  inset: 9.25cqw 4.75cqw 7.5cqw;
+}
+
+.scene {
+  display: none;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.scene.is-active { display: flex; }
+
+.scene-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 2cqw;
+  margin-bottom: 1.75cqw;
+}
+
+.scene-heading { min-width: 0; }
+
+.kicker {
+  display: flex;
+  align-items: center;
+  gap: .38cqw;
+  color: var(--md-primary);
+  font-size: var(--type-label-large);
+  font-weight: 500;
+  line-height: 1.4;
+  letter-spacing: .15px;
+}
+
+.kicker-icon {
+  display: grid;
+  place-items: center;
+  width: 1.12cqw;
+  height: 1.12cqw;
+  min-width: 15px;
+  min-height: 15px;
+  margin-right: .2cqw;
+  color: var(--md-primary);
+}
+
+.kicker-icon .md-icon { --icon-size: 100%; min-width: 0; min-height: 0; }
+
+.kicker-no {
+  color: var(--md-on-surface-variant);
+  font-variant-numeric: tabular-nums;
+}
+
+.kicker-sep { color: var(--md-outline); }
+
+.scene-heading h1 {
+  margin: .5cqw 0 0;
+  color: var(--md-on-surface);
+  font-size: clamp(18px, 2.53cqw, 50px);
+  line-height: 1.14;
+  font-weight: 400;
+  letter-spacing: -.25px;
+}
+
+.scene-lead {
+  max-width: 42cqw;
+  margin: .35cqw 0 0;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-body-large);
+  line-height: 1.5;
+  letter-spacing: .2px;
+}
+
+.head-chip {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: .45cqw;
+  min-height: clamp(15px, 1.875cqw, 30px);
+  padding: .35cqw .82cqw;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-xs);
+  color: var(--md-on-surface-variant);
+  background: transparent;
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: .2px;
+  white-space: nowrap;
+}
+
+.head-chip .md-icon { color: var(--md-primary); }
+
+.scene-body {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ============ M3 cards / chips / icons ============ */
+.panel {
+  position: relative;
+  background: var(--md-surface-container-low);
+  border: 0;
+  border-radius: var(--shape-sm);
+  box-shadow: var(--elevation-1);
+}
+
+.card-outlined {
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+  box-shadow: none;
+}
+
+.icon-tile {
+  width: 2.45cqw;
+  height: 2.45cqw;
+  min-width: 16px;
+  min-height: 16px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+
+.icon-tile .md-icon {
+  --icon-size: clamp(10px, 1.3cqw, 24px);
+  min-width: 0;
+  min-height: 0;
+}
+
+.icon-tile.secondary {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+.icon-tile.tertiary {
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+}
+
+.icon-tile.error {
+  background: var(--md-error-container);
+  color: var(--md-on-error-container);
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  min-height: clamp(12px, 1.5cqw, 24px);
+  padding: .25cqw .55cqw;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-xs);
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: .25px;
+  white-space: nowrap;
+}
+
+.eyebrow {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  letter-spacing: .2px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .7cqw;
+  flex: 0 0 auto;
+}
+
+.panel-heading {
+  display: flex;
+  align-items: center;
+  gap: .67cqw;
+  min-width: 0;
+}
+
+.panel-label {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  letter-spacing: .3px;
+  line-height: 1.35;
+}
+
+.panel-title {
+  margin: .1cqw 0 0;
+  color: var(--md-on-surface);
+  font-size: var(--type-title-large);
+  line-height: 1.3;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.panel-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: .42cqw;
+  margin-top: .65cqw;
+  padding-top: .6cqw;
+  border-top: 1px solid var(--md-outline-variant);
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  line-height: 1.4;
+}
+
+.panel-foot .md-icon { color: var(--md-primary); }
+
+/* ============ 进度 ============ */
+.track-line,
+.capacity-bar,
+.usage-track,
+.token-track,
+.io-track {
+  position: relative;
+  height: 4px;
+  min-height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--md-surface-container-highest);
+}
+
+.track-fill,
+.capacity-bar i,
+.usage-fill,
+.token-track i,
+.io-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--md-primary);
+  will-change: width, transform;
+}
+
+.track-fill {
+  position: absolute;
+  inset: 0;
+  transform-origin: left center;
+}
+
+/* ============ 底部进度 / footer ============ */
+.footer {
+  position: absolute;
+  z-index: 20;
+  left: 4.75cqw;
+  right: 4.75cqw;
+  bottom: 2.65cqw;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+}
+
+.footer-hint {
+  display: flex;
+  align-items: center;
+  gap: .45cqw;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.footer-meta {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: .55cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.footer-sep { color: var(--md-outline); }
+
+.timeline-track {
+  position: absolute;
+  z-index: 20;
+  left: 4.75cqw;
+  right: 4.75cqw;
+  bottom: 1.35cqw;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--md-surface-container-highest);
+}
+
+.timeline-fill {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--md-primary);
+  will-change: width;
+}
+
+.timeline-notches {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  pointer-events: none;
+}
+
+.timeline-notch {
+  height: 100%;
+  border-right: 1px solid var(--md-surface);
+}
+
+.timeline-notch:last-child { border-right: 0; }
+
+/* ============================================================
+   场景 1
+   ============================================================ */
+.s1-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1.2cqw;
+}
+
+.s1-cards {
+  display: grid;
+  grid-template-columns: 1.04fr .96fr;
+  gap: 1.2cqw;
+}
+
+.metric-card {
+  min-height: 16.7cqw;
+  padding: 1.35cqw;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  overflow: hidden;
+}
+
+.metric-card.model {
+  background: var(--md-surface-container-high);
+  box-shadow: none;
+}
+
+.metric-card.memory {
+  background: var(--md-surface-container-low);
+  box-shadow: var(--elevation-1);
+}
+
+.card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1cqw;
+}
+
+.metric-label-group {
+  display: flex;
+  align-items: center;
+  gap: .72cqw;
+  min-width: 0;
+}
+
+.card-sub {
+  margin-top: .1cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  letter-spacing: .2px;
+}
+
+.card-icon {
+  width: 2.45cqw;
+  height: 2.45cqw;
+  min-width: 16px;
+  min-height: 16px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+
+.memory .card-icon {
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+}
+
+.card-icon .md-icon { --icon-size: clamp(10px, 1.3cqw, 24px); min-width: 0; min-height: 0; }
+
+.metric-main {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1.2cqw;
+  margin: .8cqw 0 .65cqw;
+}
+
+.metric-value {
+  display: flex;
+  align-items: baseline;
+  gap: .48cqw;
+  color: var(--md-on-surface);
+  font-size: var(--type-metric);
+  line-height: .92;
+  font-weight: 400;
+  letter-spacing: -.055em;
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-unit {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-title-large);
+  line-height: 1;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.metric-note {
+  max-width: 15cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  line-height: 1.45;
+  text-align: right;
+}
+
+.track-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .7cqw;
+  margin-top: .42cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  letter-spacing: .2px;
+}
+
+.shortfall {
+  color: var(--md-on-error-container);
+  background: var(--md-error-container);
+  border-radius: var(--shape-xs);
+  padding: .16cqw .45cqw;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.s1-routes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.2cqw;
+}
+
+.route-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: .95cqw;
+  min-height: 7.4cqw;
+  padding: 1.15cqw 1.25cqw;
+  overflow: hidden;
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-sm);
+}
+
+.route-icon {
+  width: 2.85cqw;
+  height: 2.85cqw;
+  min-width: 18px;
+  min-height: 18px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--md-error-container);
+  color: var(--md-on-error-container);
+}
+
+.route-icon .md-icon { --icon-size: clamp(10px, 1.4cqw, 26px); min-width: 0; min-height: 0; }
+
+.route-copy { min-width: 0; flex: 1; }
+
+.route-title-wrap {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.route-title {
+  color: var(--md-on-surface);
+  font-size: var(--type-title-medium);
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.route-strike {
+  position: absolute;
+  left: -.2cqw;
+  right: -.2cqw;
+  top: 52%;
+  height: 1.5px;
+  border-radius: 2px;
+  background: var(--md-error);
+  transform: scaleX(0);
+  transform-origin: left center;
+  will-change: transform;
+}
+
+.route-reason {
+  margin-top: .1cqw;
+  color: var(--md-error);
+  font-size: var(--type-label-large);
+  font-weight: 500;
+}
+
+.route-detail {
+  margin-top: .06cqw;
+  overflow: hidden;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  line-height: 1.35;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.route-x {
+  flex: 0 0 auto;
+  width: 1.2cqw;
+  height: 1.2cqw;
+  min-width: 16px;
+  min-height: 16px;
+  color: var(--md-error);
+  opacity: .8;
+}
+
+.route-x .md-icon { --icon-size: 100%; min-width: 0; min-height: 0; }
+
+/* ============================================================
+   场景 2
+   ============================================================ */
+.s2-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1.2cqw;
+}
+
+.way-grid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 4.3cqw 1.12fr 4.3cqw 1fr;
+  align-items: stretch;
+}
+
+.way-card {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 1.25cqw;
+  overflow: hidden;
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-sm);
+  box-shadow: none;
+}
+
+.way-card.is-core {
+  background: var(--md-surface-container-highest);
+  border-color: transparent;
+  box-shadow: var(--elevation-1);
+}
+
+.way-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6cqw;
+}
+
+.way-heading {
+  display: flex;
+  align-items: center;
+  gap: .62cqw;
+  min-width: 0;
+}
+
+.way-icon {
+  width: 2.45cqw;
+  height: 2.45cqw;
+  min-width: 16px;
+  min-height: 16px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+
+.way-icon.secondary {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+.way-icon.tertiary {
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+}
+
+.way-icon .md-icon { --icon-size: clamp(10px, 1.3cqw, 24px); min-width: 0; min-height: 0; }
+
+.way-label {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-large);
+  font-weight: 500;
+  letter-spacing: .2px;
+}
+
+.way-visual {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: .45cqw 0;
+}
+
+.way-copy { margin-top: auto; }
+
+.way-name {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  letter-spacing: .2px;
+}
+
+.way-value {
+  margin-top: .12cqw;
+  color: var(--md-on-surface);
+  font-size: var(--type-headline-small);
+  font-weight: 400;
+  line-height: 1.2;
+  letter-spacing: -.2px;
+  white-space: nowrap;
+}
+
+.way-note {
+  margin-top: .16cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  line-height: 1.45;
+}
+
+.disk-stack {
+  position: relative;
+  width: 14.8cqw;
+  height: 11.2cqw;
+}
+
+.disk-layer {
+  position: absolute;
+  left: 50%;
+  width: 12.4cqw;
+  height: 3.4cqw;
+  transform: translateX(-50%);
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-sm);
+  background: var(--md-surface-container-high);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .22);
+}
+
+.disk-layer:nth-child(1) { top: .25cqw; left: 49.2%; opacity: .55; width: 11.5cqw; }
+.disk-layer:nth-child(2) { top: 1.45cqw; left: 49.6%; opacity: .75; width: 12cqw; }
+.disk-layer:nth-child(3) { top: 2.65cqw; }
+.disk-layer:nth-child(4) {
+  top: 3.85cqw;
+  background: var(--md-primary-container);
+  border-color: transparent;
+}
+
+.disk-layer::before {
+  content: "";
+  position: absolute;
+  left: .95cqw;
+  top: .85cqw;
+  width: 1.15cqw;
+  height: 1.15cqw;
+  border: 1.5px solid var(--md-outline);
+  border-radius: 50%;
+}
+
+.disk-layer:nth-child(4)::before {
+  border-color: var(--md-on-primary-container);
+}
+
+.disk-layer::after {
+  content: "";
+  position: absolute;
+  top: 1.35cqw;
+  left: 2.8cqw;
+  right: 1cqw;
+  height: 1px;
+  background: var(--md-outline-variant);
+}
+
+.disk-layer:nth-child(4)::after { background: rgba(234, 221, 255, .38); }
+
+.disk-badge {
+  position: absolute;
+  right: .4cqw;
+  bottom: .1cqw;
+  width: 2.2cqw;
+  height: 2.2cqw;
+  min-width: 14px;
+  min-height: 14px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+  box-shadow: var(--elevation-1);
+}
+
+.disk-badge .md-icon { --icon-size: clamp(8px, 1.05cqw, 20px); min-width: 0; min-height: 0; }
+
+.capacity-box {
+  position: relative;
+  width: 100%;
+  height: 10.4cqw;
+  overflow: hidden;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container-lowest);
+}
+
+.capacity-icon {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  --icon-size: clamp(14px, 3.15cqw, 58px);
+  transform: translate(-50%, -58%);
+  color: var(--md-outline);
+  opacity: .55;
+}
+
+.capacity-mark {
+  position: absolute;
+  left: .9cqw;
+  right: .9cqw;
+  bottom: .72cqw;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  letter-spacing: .3px;
+}
+
+.capacity-mark span:first-child { color: var(--md-primary); }
+
+.cpu-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 12.2cqw;
+  height: 12.2cqw;
+}
+
+.cpu-chip {
+  position: relative;
+  width: 9.4cqw;
+  height: 9.4cqw;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-md);
+  background: var(--md-surface-container-high);
+  color: var(--md-primary);
+}
+
+.cpu-chip .md-icon {
+  --icon-size: clamp(12px, 2.6cqw, 50px);
+  z-index: 1;
+}
+
+.cpu-chip::before {
+  content: "";
+  position: absolute;
+  inset: .75cqw;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-sm);
+  opacity: .65;
+}
+
+.cpu-chip::after {
+  content: "";
+  position: absolute;
+  inset: -0.35cqw;
+  border-top: 2px solid var(--md-outline-variant);
+  border-bottom: 2px solid var(--md-outline-variant);
+  border-radius: .4cqw;
+}
+
+.cpu-dots {
+  position: absolute;
+  inset: 1.2cqw;
+  background-image: radial-gradient(circle, var(--md-outline) .7px, transparent .9px);
+  background-size: .72cqw .72cqw;
+  opacity: .3;
+}
+
+.cpu-pulse {
+  position: absolute;
+  width: .5cqw;
+  height: .5cqw;
+  min-width: 6px;
+  min-height: 6px;
+  border-radius: 50%;
+  background: var(--md-tertiary);
+  opacity: 0;
+}
+
+.flow-column {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  padding-top: .5cqw;
+}
+
+.flow-main {
+  color: var(--md-primary);
+  font-size: var(--type-label-large);
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: .2px;
+  white-space: nowrap;
+}
+
+.flow-sub {
+  margin-top: .12cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: .2px;
+  white-space: nowrap;
+}
+
+.flow-track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 1.2cqw;
+  margin-top: .55cqw;
+}
+
+.flow-track::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: .5cqw;
+  top: 50%;
+  height: 1px;
+  background: var(--md-outline-variant);
+}
+
+.flow-track::after { display: none; }
+
+.flow-dot {
+  position: absolute;
+  z-index: 2;
+  left: 0;
+  top: 50%;
+  width: .5cqw;
+  height: .5cqw;
+  min-width: 6px;
+  min-height: 6px;
+  border-radius: 50%;
+  background: var(--md-primary);
+  opacity: 0;
+  transform: translate(-50%, -50%);
+  will-change: left, opacity;
+}
+
+.flow-arrow {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  width: .95cqw;
+  height: .95cqw;
+  min-width: 14px;
+  min-height: 14px;
+  transform: translateY(-50%);
+  color: var(--md-outline);
+}
+
+.flow-arrow .md-icon { --icon-size: 100%; min-width: 0; min-height: 0; }
+
+.impl-strip {
+  flex: 0 0 auto;
+  min-height: 3.9cqw;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-sm);
+  background: var(--md-surface-container-low);
+}
+
+.impl-item {
+  display: flex;
+  align-items: center;
+  gap: .65cqw;
+  min-width: 0;
+  padding: 0 1.15cqw;
+  border-left: 1px solid var(--md-outline-variant);
+}
+
+.impl-item:first-child { border-left: 0; }
+.impl-icon { color: var(--md-primary); display: flex; }
+.impl-icon .md-icon { --icon-size: clamp(9px, 1.15cqw, 22px); min-width: 0; min-height: 0; }
+
+.impl-code {
+  color: var(--md-on-surface);
+  font-size: var(--type-label-large);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.impl-text {
+  overflow: hidden;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-body-medium);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ============================================================
+   场景 3 · 64 层搬运 + 计算
+   ============================================================ */
+.s3-body {
+  display: flex;
+  flex-direction: column;
+  gap: .85cqw;
+}
+
+/* ---------- 输入输出条 ---------- */
+.io-strip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: .9cqw;
+  padding: .62cqw 1.05cqw;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-sm);
+  background: var(--md-surface-container-low);
+}
+
+.io-side {
+  display: flex;
+  align-items: center;
+  gap: .55cqw;
+  min-width: 0;
+}
+
+.io-side.answer { flex: 1; }
+
+.io-tag {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 1.6cqw;
+  height: 1.6cqw;
+  min-width: 18px;
+  min-height: 18px;
+  border-radius: 50%;
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  line-height: 1;
+}
+
+.io-tag.q {
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+
+.io-tag.a {
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+}
+
+.io-question {
+  color: var(--md-on-surface);
+  font-size: clamp(12px, 1.32cqw, 28px);
+  line-height: 1.25;
+  letter-spacing: -.1px;
+  white-space: nowrap;
+}
+
+.io-chips {
+  display: flex;
+  align-items: center;
+  gap: .26cqw;
+}
+
+.io-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: .18cqw;
+  padding: .16cqw .34cqw;
+  border: 1px solid var(--md-outline-variant);
+  border-radius: var(--shape-xs);
+  color: var(--md-on-surface);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  line-height: 1.2;
+  opacity: 0;
+  will-change: opacity, transform;
+}
+
+.io-chip b {
+  color: var(--md-primary);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.io-arrow {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 1.05cqw;
+  height: 1.05cqw;
+  min-width: 13px;
+  min-height: 13px;
+  color: var(--md-outline);
+}
+
+.io-arrow .md-icon { --icon-size: 100%; min-width: 0; min-height: 0; }
+
+.io-answer {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  color: var(--md-on-surface);
+  font-size: clamp(13px, 1.55cqw, 33px);
+  line-height: 1.2;
+  letter-spacing: -.2px;
+  white-space: nowrap;
+}
+
+.io-token {
+  display: none;
+  will-change: opacity, transform;
+}
+
+.io-token.is-on { display: inline-block; }
+
+.io-caret {
+  display: inline-block;
+  width: .13cqw;
+  min-width: 2px;
+  height: .9em;
+  margin-left: .1cqw;
+  border-radius: 1px;
+  background: var(--md-tertiary);
+  transform: translateY(.06em);
+  will-change: opacity;
+}
+
+.io-stats {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: .85cqw;
+  padding-left: .85cqw;
+  border-left: 1px solid var(--md-outline-variant);
+}
+
+.io-stat {
+  display: flex;
+  align-items: baseline;
+  gap: .26cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+}
+
+.io-stat b {
+  color: var(--md-on-surface);
+  font-size: var(--type-title-medium);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.io-phase {
+  display: inline-flex;
+  align-items: center;
+  min-height: clamp(13px, 1.55cqw, 25px);
+  padding: .2cqw .5cqw;
+  border-radius: var(--shape-xs);
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.io-phase.is-prefill {
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+
+.io-phase.is-decode {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+/* ---------- 四区 ---------- */
+.zones {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1.1fr .95fr;
+  gap: .9cqw;
+}
+
+.zone {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 1.05cqw;
+  border-radius: var(--shape-sm);
+  background: var(--md-surface-container-low);
+  box-shadow: var(--elevation-1);
+  overflow: hidden;
+}
+
+.zone.is-outlined {
+  background: var(--md-surface);
+  border: 1px solid var(--md-outline-variant);
+  box-shadow: none;
+}
+
+.zone-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: .5cqw;
+}
+
+.zone-heading {
+  display: flex;
+  align-items: center;
+  gap: .55cqw;
+  min-width: 0;
+}
+
+.zone-heading .icon-tile {
+  width: 2.15cqw;
+  height: 2.15cqw;
+  min-width: 15px;
+  min-height: 15px;
+}
+
+.zone-heading .icon-tile .md-icon { --icon-size: clamp(9px, 1.15cqw, 21px); }
+
+.zone-label {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  letter-spacing: .3px;
+  line-height: 1.3;
+}
+
+.zone-title {
+  color: var(--md-on-surface);
+  font-size: var(--type-title-medium);
+  line-height: 1.25;
+  font-weight: 400;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.zone-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5cqw;
+  margin-top: auto;
+  padding-top: .45cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  line-height: 1.35;
+}
+
+.zone-foot b {
+  color: var(--md-on-surface);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* 磁盘 64 格 */
+.layer-grid {
+  flex: 0 0 auto;
+  width: 19.6cqw;
+  height: 19.6cqw;
+  margin: .5cqw auto .1cqw;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  gap: .22cqw;
+}
+
+.layer-cell {
+  display: grid;
+  place-items: center;
+  border-radius: 2px;
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+  font-size: clamp(5px, .48cqw, 10px);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  will-change: background-color, color;
+}
+
+.layer-cell.is-read {
+  background: var(--md-surface-container);
+  color: var(--md-outline);
+}
+
+.layer-cell.is-current {
+  background: var(--md-primary);
+  color: var(--md-on-primary);
+}
+
+/* 内存 8 槽 */
+.mem-grid {
+  flex: 1;
+  min-height: 0;
+  margin-top: .5cqw;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: repeat(4, 1fr);
+  gap: .34cqw;
+}
+
+.mem-slot {
+  position: relative;
+  border-radius: var(--shape-xs);
+}
+
+.mem-slot::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px dashed rgba(147, 143, 153, .2);
+  border-radius: inherit;
+}
+
+.mem-block {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .3cqw;
+  padding: 0 .5cqw;
+  border-radius: inherit;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+  opacity: 0;
+  will-change: opacity;
+}
+
+.mem-name {
+  overflow: hidden;
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mem-pin {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: .18cqw;
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  opacity: .75;
+}
+
+.mem-block.is-evict {
+  background: var(--md-error-container);
+  color: var(--md-on-error-container);
+}
+
+.mem-pin::before {
+  content: "";
+  width: .22cqw;
+  height: .22cqw;
+  min-width: 3px;
+  min-height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.mem-meta {
+  flex: 0 0 auto;
+  margin-top: .55cqw;
+}
+
+.mem-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .4cqw;
+}
+
+.mem-used {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.mem-evict {
+  padding: .1cqw .35cqw;
+  border-radius: var(--shape-xs);
+  background: var(--md-error-container);
+  color: var(--md-on-error-container);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  line-height: 1.3;
+  opacity: 0;
+  white-space: nowrap;
+}
+
+.mem-bar {
+  position: relative;
+  height: 4px;
+  min-height: 4px;
+  margin-top: .3cqw;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--md-surface-container-highest);
+}
+
+.mem-bar i {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--md-primary);
+  transform-origin: left center;
+  will-change: transform;
+}
+
+/* CPU 计算 */
+.cpu-visual {
+  position: relative;
+  flex: 0 0 auto;
+  width: 7.4cqw;
+  height: 7.4cqw;
+  margin: .65cqw auto .2cqw;
+  display: grid;
+  place-items: center;
+}
+
+.cpu-ring {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.cpu-ring .ring-track {
+  fill: none;
+  stroke: var(--md-surface-container-highest);
+  stroke-width: 3;
+}
+
+.cpu-ring .ring-arc {
+  fill: none;
+  stroke: var(--md-primary);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-dasharray: 289.03;
+  stroke-dashoffset: 289.03;
+  will-change: stroke-dashoffset;
+}
+
+.cpu-core {
+  position: relative;
+  width: 4.1cqw;
+  height: 4.1cqw;
+  display: grid;
+  place-items: center;
+  border-radius: var(--shape-md);
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+  will-change: transform;
+}
+
+.cpu-core .md-icon { --icon-size: clamp(12px, 1.7cqw, 34px); }
+
+.cpu-sub {
+  flex: 0 0 auto;
+  margin-top: .15cqw;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  text-align: center;
+}
+
+.cpu-range {
+  flex: 0 0 auto;
+  text-align: center;
+  color: var(--md-on-surface);
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .2px;
+}
+
+.cpu-lanes {
+  flex: 0 0 auto;
+  height: 4.6cqw;
+  margin-top: auto;
+  display: flex;
+  align-items: flex-end;
+  gap: .26cqw;
+  padding: .5cqw 0 .35cqw;
+}
+
+.cpu-lane {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--md-surface-container-high);
+}
+
+.cpu-lane i {
+  display: block;
+  width: 100%;
+  height: 0;
+  background: var(--md-primary);
+  will-change: height;
+}
+
+/* KV 缓存 */
+.kv-grid {
+  flex: 1;
+  min-height: 0;
+  margin-top: .55cqw;
+  display: flex;
+  gap: .3cqw;
+}
+
+.kv-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: .22cqw;
+}
+
+.kv-track {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--md-surface-container-high);
+}
+
+.kv-track::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent 3px,
+    rgba(20, 18, 24, .55) 3px,
+    rgba(20, 18, 24, .55) 4px
+  );
+  pointer-events: none;
+}
+
+.kv-track i {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 0;
+  background: var(--md-primary);
+  will-change: height;
+}
+
+.kv-col.is-gen .kv-track i { background: var(--md-tertiary); }
+
+.kv-col.is-gen .kv-label { color: var(--md-tertiary); }
+
+.kv-col.is-gen-start { margin-left: .3cqw; }
+
+.kv-label {
+  flex: 0 0 auto;
+  overflow: hidden;
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-small);
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  white-space: nowrap;
+  text-overflow: clip;
+}
+
+/* 飞行块 */
+.zone-fly {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.fly-block {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 3px;
+  background: var(--md-primary-container);
+  box-shadow: 0 0 0 1px rgba(208, 188, 255, .42), 0 8px 18px rgba(0, 0, 0, .45);
+  color: var(--md-on-primary-container);
+  font-size: clamp(5px, .5cqw, 11px);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  will-change: transform, opacity;
+}
+
+/* ============================================================
+   场景 4 · 小结
+   ============================================================ */
+.final-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1.34fr .66fr;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 1.7cqw 3cqw;
+  position: relative;
+}
+
+.final-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  position: relative;
+  z-index: 2;
+}
+
+.summary-list {
+  border-top: 1px solid var(--md-outline-variant);
+}
+
+.summary-item {
+  display: flex;
+  align-items: center;
+  gap: .9cqw;
+  padding: 1.2cqw 0;
+  border-bottom: 1px solid var(--md-outline-variant);
+  will-change: opacity, transform;
+}
+
+.summary-icon {
+  width: 2.9cqw;
+  height: 2.9cqw;
+  min-width: 18px;
+  min-height: 18px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+}
+
+.summary-icon.secondary {
+  background: var(--md-secondary-container);
+  color: var(--md-on-secondary-container);
+}
+
+.summary-icon.tertiary {
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+}
+
+.summary-icon .md-icon { --icon-size: clamp(10px, 1.45cqw, 28px); min-width: 0; min-height: 0; }
+
+.summary-text-wrap {
+  display: flex;
+  align-items: baseline;
+  gap: .85cqw;
+  min-width: 0;
+}
+
+.summary-no {
+  color: var(--md-on-surface-variant);
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.summary-text {
+  color: var(--md-on-surface);
+  font-size: var(--type-title-large);
+  font-weight: 400;
+  line-height: 1.35;
+  letter-spacing: -.1px;
+}
+
+.summary-formula {
+  display: flex;
+  align-items: baseline;
+  gap: .12em;
+  min-width: 0;
+  color: var(--md-on-surface);
+  font-size: var(--type-title-large);
+  font-weight: 400;
+  line-height: 1.35;
+  letter-spacing: -.1px;
+  white-space: nowrap;
+}
+
+.summary-formula .op {
+  padding: 0 .12em;
+  color: var(--md-outline);
+}
+
+.summary-formula .term.primary { color: var(--md-primary); }
+.summary-formula .term.tertiary { color: var(--md-tertiary); }
+
+.final-art {
+  min-width: 0;
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+.final-orb {
+  position: absolute;
+  width: 18.4cqw;
+  height: 18.4cqw;
+  display: grid;
+  place-items: center;
+  border-radius: var(--shape-lg);
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+  transform: rotate(-6deg);
+}
+
+.final-orb .md-icon {
+  --icon-size: clamp(32px, 6.2cqw, 120px);
+  transform: rotate(6deg);
+  opacity: .92;
+}
+
+.final-orb-chip {
+  position: absolute;
+  right: 3.2cqw;
+  bottom: 9.1cqw;
+  width: 4.2cqw;
+  height: 4.2cqw;
+  min-width: 24px;
+  min-height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--md-tertiary-container);
+  color: var(--md-on-tertiary-container);
+  box-shadow: var(--elevation-2);
+}
+
+.final-orb-chip .md-icon { --icon-size: clamp(12px, 1.8cqw, 34px); min-width: 0; min-height: 0; }
+
+.final-credit {
+  margin-left: auto;
+  padding-left: 1.2cqw;
+  min-width: 0;
+  color: var(--md-on-primary-container);
+  font-size: var(--type-label-medium);
+  font-weight: 500;
+  letter-spacing: .2px;
+  white-space: nowrap;
+  opacity: .72;
+  will-change: opacity;
+}
+
+/* 收束句：整段最后一句，独立成条，进来就能读。 */
+.final-close {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: .9cqw;
+  padding: 1.15cqw 1.4cqw;
+  border-radius: var(--shape-md);
+  background: var(--md-primary-container);
+  color: var(--md-on-primary-container);
+  will-change: opacity, transform;
+}
+
+.final-close-icon {
+  width: 2.3cqw;
+  height: 2.3cqw;
+  min-width: 16px;
+  min-height: 16px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: rgba(234, 221, 255, .14);
+  color: var(--md-on-primary-container);
+}
+
+.final-close-icon .md-icon { --icon-size: clamp(10px, 1.25cqw, 23px); min-width: 0; min-height: 0; }
+
+.final-close-text {
+  min-width: 0;
+  font-size: clamp(15px, 1.95cqw, 40px);
+  font-weight: 400;
+  line-height: 1.25;
+  letter-spacing: -.2px;
+}
+
+/* 图标的语义色 */
+.tone-primary { --tone: var(--md-primary); --tone-bg: var(--md-primary-container); --tone-fg: var(--md-on-primary-container); }
+.tone-secondary { --tone: var(--md-secondary); --tone-bg: var(--md-secondary-container); --tone-fg: var(--md-on-secondary-container); }
+.tone-tertiary { --tone: var(--md-tertiary); --tone-bg: var(--md-tertiary-container); --tone-fg: var(--md-on-tertiary-container); }
+
+@media (prefers-reduced-motion: reduce) {
+  .timeline-fill,
+  .track-fill,
+  .usage-fill,
+  .token-track i,
+  .io-track i { will-change: auto; }
+}
+
+
+/* ============================================================
+   竖屏 9:16（1080×1920）· 短视频排版（第四版）
+   ============================================================ */
+@media (orientation: portrait) {
+  #stage {
+    width: min(100vw, 56.25vh);
+    height: min(100vh, 177.7778vw);
+  }
+
+  .brand-name { font-size: clamp(18px, 1.9cqw, 34px); }
+  .brand-badge { font-size: clamp(13px, 1.4cqw, 28px); }
+  .top-status { font-size: clamp(13px, 1.45cqw, 28px); height: 3.6cqw; }
+  .footer { font-size: clamp(13px, 1.45cqw, 28px); }
+
+  .scene { inset: 6.3cqw 4cqw 6.1cqw; }
+  .scene-head { margin-bottom: 1.1cqw; align-items: flex-start; position: relative; }
+  .scene-heading { width: 100%; }
+  .kicker { font-size: clamp(15px, 1.85cqw, 36px); }
+  .scene-heading h1 {
+    font-size: clamp(40px, 6.7cqw, 130px);
+    line-height: 1.04;
+    text-wrap: balance;
+  }
+  .scene-lead {
+    font-size: clamp(17px, 2.5cqw, 48px);
+    line-height: 1.32;
+    max-width: 94cqw;
+    text-wrap: balance;
+  }
+  .head-chip { position: absolute; top: 0; right: 0; font-size: clamp(12px, 1.5cqw, 28px); padding: .6cqw 1cqw; }
+
+  .s3-body { gap: 1.2cqw; }
+  .io-strip { padding: 1.15cqw 1.5cqw; gap: .95cqw; }
+  .io-question { font-size: clamp(24px, 4.2cqw, 88px); }
+  .io-answer { font-size: clamp(26px, 4.6cqw, 96px); }
+  .io-tag { width: 3.2cqw; height: 3.2cqw; font-size: clamp(12px, 1.6cqw, 30px); }
+  .io-chip { font-size: clamp(12px, 1.9cqw, 36px); padding: .3cqw .5cqw; }
+  .io-stat { font-size: clamp(12px, 1.75cqw, 32px); }
+  .io-stat b { font-size: clamp(18px, 2.8cqw, 54px); }
+  .io-phase { font-size: clamp(12px, 1.75cqw, 32px); min-height: 3.2cqw; padding: .3cqw .8cqw; }
+  .io-stats { gap: 1cqw; }
+
+  .zones {
+    grid-template-columns: .96fr 1.04fr;
+    grid-template-rows: .98fr 1.06fr 1.02fr;
+    grid-template-areas:
+      "disk disk"
+      "mem cpu"
+      "kv kv";
+    gap: 1.1cqw;
+  }
+  .zones > .zone:nth-child(1) { grid-area: disk; }
+  .zones > .zone:nth-child(2) { grid-area: mem; }
+  .zones > .zone:nth-child(3) { grid-area: cpu; }
+  .zones > .zone:nth-child(4) { grid-area: kv; }
+
+  .zone { padding: 1.3cqw; border-radius: 1.5cqw; }
+  .zone-heading { gap: .8cqw; }
+  .zone-heading .icon-tile { width: 4.4cqw; height: 4.4cqw; }
+  .zone-heading .icon-tile .md-icon { --icon-size: clamp(18px, 2.3cqw, 44px); }
+  .zone-label { font-size: clamp(15px, 2.4cqw, 44px); }
+  .zone-title { font-size: clamp(28px, 4.1cqw, 72px); }
+  .zone-foot { font-size: clamp(13px, 2cqw, 38px); padding-top: .6cqw; }
+  .tag { font-size: clamp(12px, 1.7cqw, 30px); min-height: 3.4cqw; padding: .4cqw .9cqw; }
+
+  .layer-grid {
+    flex: 1;
+    width: 100%;
+    height: auto;
+    min-height: 0;
+    margin: .5cqw 0 0;
+    grid-template-columns: repeat(16, 1fr);
+    grid-template-rows: repeat(4, 1fr);
+    gap: .42cqw;
+  }
+  .layer-cell { font-size: clamp(14px, 2.4cqw, 44px); border-radius: 5px; }
+
+  .mem-grid {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: repeat(4, 1fr);
+    gap: .65cqw;
+    margin-top: .65cqw;
+  }
+  .mem-block { padding: 0 .9cqw; }
+  .mem-name { font-size: clamp(18px, 3.6cqw, 64px); }
+  .mem-pin { font-size: clamp(12px, 2.2cqw, 40px); }
+  .mem-used, .mem-evict { font-size: clamp(12px, 1.95cqw, 34px); }
+  .arena-note { font-size: clamp(12px, 1.6cqw, 30px); }
+
+  .cpu-visual { width: 11.8cqw; height: 11.8cqw; margin: .3cqw auto .1cqw; }
+  .cpu-core { width: 8.4cqw; height: 8.4cqw; }
+  .cpu-core .md-icon { --icon-size: clamp(22px, 2.9cqw, 54px); }
+  .cpu-range { font-size: clamp(17px, 2.5cqw, 48px); }
+  .cpu-sub { font-size: clamp(12px, 1.85cqw, 34px); }
+  .cpu-lanes { height: 7.2cqw; gap: .5cqw; }
+
+  .kv-grid { gap: .6cqw; margin-top: .65cqw; }
+  .kv-label { font-size: clamp(16px, 3.5cqw, 64px); }
+  .kv-col.is-gen-start { margin-left: .6cqw; }
+
+  .fly-block { font-size: clamp(12px, 1.7cqw, 32px); }
+
+  /* 场景 1 */
+  .s1-body { gap: 1.4cqw; justify-content: space-evenly; }
+  .s1-cards { grid-template-columns: 1fr; gap: 1.4cqw; }
+  .metric-card { min-height: 40cqw; padding: 2cqw 2.2cqw; }
+  .metric-value { font-size: clamp(100px, 17.6cqw, 300px); }
+  .metric-note { max-width: 32cqw; font-size: clamp(16px, 2.1cqw, 42px); }
+  .eyebrow, .card-sub { font-size: clamp(14px, 1.85cqw, 36px); }
+  .s1-routes { grid-template-columns: 1fr; gap: 1.3cqw; }
+  .route-card { min-height: 12.5cqw; padding: 1.3cqw 1.7cqw; }
+  .route-title { font-size: clamp(24px, 3.1cqw, 60px); }
+  .route-reason { font-size: clamp(19px, 2.5cqw, 50px); }
+  .route-detail { font-size: clamp(15px, 1.85cqw, 38px); }
+  .route-icon { width: 5.8cqw; height: 5.8cqw; }
+
+  /* 场景 2 */
+  .way-grid { grid-template-columns: 1fr; gap: 1.1cqw; align-content: center; }
+  .way-card { min-height: 31cqw; padding: 1.7cqw 2cqw; }
+  .way-label { font-size: clamp(14px, 1.85cqw, 36px); }
+  .way-name { font-size: clamp(15px, 2cqw, 38px); }
+  .way-value { font-size: clamp(32px, 4.4cqw, 92px); }
+  .way-card .card-sub { font-size: clamp(14px, 1.85cqw, 36px); }
+  .flow-column {
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+    gap: .8cqw;
+    height: auto;
+    padding: .2cqw 0;
+  }
+  .flow-column .flow-main,
+  .flow-column .flow-sub {
+    display: inline;
+    margin: 0;
+    font-size: clamp(14px, 1.85cqw, 36px);
+  }
+  .flow-track { display: none; }
+  .flow-column::before {
+    content: "↓";
+    color: var(--md-outline);
+    font-size: clamp(16px, 2cqw, 40px);
+    line-height: 1;
+  }
+  .impl-strip { grid-template-columns: 1fr; gap: .3cqw; }
+  .impl-strip .impl-item { font-size: clamp(13px, 1.75cqw, 34px); min-height: 4.8cqw; }
+
+  /* 场景 4 */
+  .final-body {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-evenly;
+    gap: 1.8cqw;
+  }
+  .final-art { display: grid; order: -1; flex: 0 0 auto; height: 31cqw; }
+  .final-orb { width: 25cqw; height: 25cqw; }
+  .final-orb .md-icon { --icon-size: clamp(56px, 10cqw, 200px); }
+  .final-orb-chip {
+    right: calc(50% - 14.2cqw);
+    bottom: 1cqw;
+    width: 7cqw;
+    height: 7cqw;
+  }
+  .final-orb-chip .md-icon { --icon-size: clamp(16px, 2.4cqw, 44px); }
+  .final-copy { flex: 0 0 auto; }
+  .summary-item { padding: 2.7cqw 0; gap: 1.3cqw; }
+  .summary-icon { width: 7cqw; height: 7cqw; }
+  .summary-icon .md-icon { --icon-size: clamp(22px, 2.9cqw, 54px); }
+  .summary-text, .summary-formula { font-size: clamp(26px, 3.7cqw, 66px); }
+  .summary-no { font-size: clamp(14px, 2cqw, 38px); }
+  .final-close { flex: 0 0 auto; margin-top: 0; padding: 2.3cqw 2.2cqw; }
+  .final-close-text { font-size: clamp(30px, 4.6cqw, 88px); }
+  .final-close-icon { width: 6.8cqw; height: 6.8cqw; }
+}
+</style>
+</head>
+
+<body>
+<svg class="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-storage" viewBox="0 0 24 24">
+    <rect x="3.5" y="5" width="17" height="14" rx="2.5"/>
+    <path d="M3.5 14h17"/>
+    <path d="M7 17h4"/>
+    <circle cx="17.2" cy="17" r=".9" fill="currentColor" stroke="none"/>
+  </symbol>
+  <symbol id="i-memory" viewBox="0 0 24 24">
+    <rect x="7" y="7" width="10" height="10" rx="1.6"/>
+    <rect x="10" y="10" width="4" height="4" rx=".8"/>
+    <path d="M9 4v3M12 4v3M15 4v3M9 17v3M12 17v3M15 17v3M4 9h3M4 12h3M4 15h3M17 9h3M17 12h3M17 15h3"/>
+  </symbol>
+  <symbol id="i-cpu" viewBox="0 0 24 24">
+    <rect x="4" y="4" width="16" height="16" rx="2.2"/>
+    <rect x="8" y="8" width="8" height="8" rx="1.2"/>
+    <path d="M8 2v2M12 2v2M16 2v2M8 20v2M12 20v2M16 20v2M2 8h2M2 12h2M2 16h2M20 8h2M20 12h2M20 16h2"/>
+  </symbol>
+  <symbol id="i-tree" viewBox="0 0 24 24">
+    <rect x="3" y="3" width="6" height="5" rx="1.5"/>
+    <rect x="15" y="3" width="6" height="5" rx="1.5"/>
+    <rect x="9" y="16" width="6" height="5" rx="1.5"/>
+    <path d="M6 8v4.5A2.5 2.5 0 0 0 8.5 15H12M18 8v4.5a2.5 2.5 0 0 1-2.5 2.5H12M12 15v1"/>
+  </symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24">
+    <path d="M4 12h15"/>
+    <path d="m13.5 6 6 6-6 6"/>
+  </symbol>
+  <symbol id="i-close" viewBox="0 0 24 24">
+    <path d="M6 6l12 12M18 6 6 18"/>
+  </symbol>
+  <symbol id="i-check" viewBox="0 0 24 24">
+    <path d="m5 12.5 4.4 4.4L19 6.5"/>
+  </symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="8.4"/>
+    <path d="m8.3 12.2 2.5 2.5 4.9-5"/>
+  </symbol>
+  <symbol id="i-error" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="8.4"/>
+    <path d="M12 7.4v5.6"/>
+    <circle cx="12" cy="16.7" r=".95" fill="currentColor" stroke="none"/>
+  </symbol>
+  <symbol id="i-info" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="8.4"/>
+    <path d="M12 10.8v5.3"/>
+    <circle cx="12" cy="7.6" r=".95" fill="currentColor" stroke="none"/>
+  </symbol>
+  <symbol id="i-download" viewBox="0 0 24 24">
+    <path d="M12 3.6v10.8"/>
+    <path d="m7.9 10.8 4.1 4.1 4.1-4.1"/>
+    <path d="M4.5 19.2h15"/>
+  </symbol>
+  <symbol id="i-speed" viewBox="0 0 24 24">
+    <path d="M4.1 17.2a8.4 8.4 0 1 1 15.8 0"/>
+    <path d="m12 16.7 4.1-5.5"/>
+    <circle cx="12" cy="17" r="1.1" fill="currentColor" stroke="none"/>
+  </symbol>
+  <symbol id="i-history" viewBox="0 0 24 24">
+    <path d="M4.2 11.8a7.9 7.9 0 1 0 2.2-5.5L4.2 8.5"/>
+    <path d="M4.2 4.3v4.2h4.2"/>
+    <path d="M12 8.1v4.4l3 1.8"/>
+  </symbol>
+  <symbol id="i-token" viewBox="0 0 24 24">
+    <path d="M12 3.2 19.4 7.6v8.8L12 20.8 4.6 16.4V7.6L12 3.2Z"/>
+    <circle cx="12" cy="12" r="2.4"/>
+  </symbol>
+  <symbol id="i-block" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="8.4"/>
+    <path d="m6.2 6.2 11.6 11.6"/>
+  </symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24">
+    <path d="M4 8h14M14.5 4.5 18 8l-3.5 3.5"/>
+    <path d="M20 16H6M9.5 12.5 6 16l3.5 3.5"/>
+  </symbol>
+  <symbol id="i-code" viewBox="0 0 24 24">
+    <path d="m8 7-4.5 5L8 17M16 7l4.5 5L16 17M13.5 4.2l-3 15.6"/>
+  </symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24">
+    <path d="M13.2 2.7 5.1 13.1h5.6l-.9 8.2 8.1-10.5h-5.6l.9-8.1Z"/>
+  </symbol>
+  <symbol id="i-route" viewBox="0 0 24 24">
+    <circle cx="5.5" cy="6" r="2.2"/>
+    <circle cx="18.5" cy="18" r="2.2"/>
+    <path d="M7.7 6h3.5a3 3 0 0 1 0 6h-1.4a3 3 0 0 0 0 6h6.5"/>
+  </symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24">
+    <path d="m12 3.5 8.3 4.4-8.3 4.4-8.3-4.4L12 3.5Z"/>
+    <path d="m4.4 12.2 7.6 4 7.6-4M4.4 16.4l7.6 4 7.6-4"/>
+  </symbol>
+</svg>
+
+<main id="stage" aria-label="">
+  <header class="topbar">
+    <div class="brand-lockup">
+      <span class="brand-mark" aria-hidden="true">
+        <svg class="md-icon"><use href="#i-storage"></use></svg>
+      </span>
+      <span class="brand-copy">
+        <span class="brand-name" data-t="chrome.brand"></span>
+        <span class="brand-badge" data-t="chrome.badge"></span>
+      </span>
+    </div>
+    <span class="top-status">
+      <svg class="md-icon sm" aria-hidden="true"><use href="#i-check-circle"></use></svg>
+      <span data-t="chrome.topStatus"></span>
+    </span>
+  </header>
+
+  <div class="scenes" id="scenes">
+    <!-- 01 约束 -->
+    <section class="scene" id="scene-1" data-scene="scene-1" aria-labelledby="s1-title">
+      <header class="scene-head">
+        <div class="scene-heading">
+          <div class="kicker">
+            <span class="kicker-icon" aria-hidden="true"><svg class="md-icon"><use href="#i-error"></use></svg></span>
+            <span class="kicker-no" data-t="s1.no"></span>
+            <span class="kicker-sep">/</span>
+            <span data-t="s1.kicker"></span>
+          </div>
+          <h1 id="s1-title" data-t="s1.title"></h1>
+          <p class="scene-lead" data-t="s1.lead"></p>
+        </div>
+        <span class="head-chip" data-t="s1.chip"></span>
+      </header>
+
+      <div class="scene-body s1-body">
+        <div class="s1-cards">
+          <article class="metric-card panel model" id="s1Model">
+            <div class="card-top">
+              <div class="metric-label-group">
+                <span class="card-icon" aria-hidden="true">
+                  <svg class="md-icon"><use href="#i-storage"></use></svg>
+                </span>
+                <div>
+                  <div class="eyebrow" data-t="s1.model.label"></div>
+                  <div class="card-sub" data-t="s1.model.meta"></div>
+                </div>
+              </div>
+            </div>
+            <div class="metric-main">
+              <div class="metric-value">
+                <span data-t="s1.model.value"></span>
+                <span class="metric-unit" data-t="s1.model.unit"></span>
+              </div>
+              <div class="metric-note" data-t="s1.model.note"></div>
+            </div>
+            <div>
+              <div class="track-line"><i class="track-fill" id="s1ModelFill"></i></div>
+              <div class="track-meta"><span data-t="s1.model.track"></span></div>
+            </div>
+          </article>
+
+          <article class="metric-card panel memory" id="s1Memory">
+            <div class="card-top">
+              <div class="metric-label-group">
+                <span class="card-icon" aria-hidden="true">
+                  <svg class="md-icon"><use href="#i-memory"></use></svg>
+                </span>
+                <div>
+                  <div class="eyebrow" data-t="s1.memory.label"></div>
+                  <div class="card-sub" data-t="s1.memory.meta"></div>
+                </div>
+              </div>
+            </div>
+            <div class="metric-main">
+              <div class="metric-value">
+                <span data-t="s1.memory.value"></span>
+                <span class="metric-unit" data-t="s1.memory.unit"></span>
+              </div>
+              <div class="metric-note" data-t="s1.memory.note"></div>
+            </div>
+            <div>
+              <div class="track-line"><i class="track-fill" id="s1MemoryFill"></i></div>
+              <div class="track-meta">
+                <span data-t="s1.memory.track"></span>
+                <span class="shortfall" data-t="s1.memory.shortfall"></span>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <div class="s1-routes">
+          <article class="route-card" data-route="0">
+            <span class="route-icon" aria-hidden="true">
+              <svg class="md-icon"><use href="#i-block"></use></svg>
+            </span>
+            <div class="route-copy">
+              <div class="route-title-wrap">
+                <span class="route-title" data-t="s1.routes.0.title"></span>
+                <i class="route-strike" id="s1Strike0"></i>
+              </div>
+              <div class="route-reason" data-t="s1.routes.0.reason"></div>
+              <div class="route-detail" data-t="s1.routes.0.detail"></div>
+            </div>
+            <span class="route-x" id="s1X0" aria-hidden="true">
+              <svg class="md-icon"><use href="#i-close"></use></svg>
+            </span>
+          </article>
+
+          <article class="route-card" data-route="1">
+            <span class="route-icon" aria-hidden="true">
+              <svg class="md-icon"><use href="#i-download"></use></svg>
+            </span>
+            <div class="route-copy">
+              <div class="route-title-wrap">
+                <span class="route-title" data-t="s1.routes.1.title"></span>
+                <i class="route-strike" id="s1Strike1"></i>
+              </div>
+              <div class="route-reason" data-t="s1.routes.1.reason"></div>
+              <div class="route-detail" data-t="s1.routes.1.detail"></div>
+            </div>
+            <span class="route-x" id="s1X1" aria-hidden="true">
+              <svg class="md-icon"><use href="#i-close"></use></svg>
+            </span>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02 核心思路 -->
+    <section class="scene" id="scene-2" data-scene="scene-2" aria-labelledby="s2-title">
+      <header class="scene-head">
+        <div class="scene-heading">
+          <div class="kicker">
+            <span class="kicker-icon" aria-hidden="true"><svg class="md-icon"><use href="#i-route"></use></svg></span>
+            <span class="kicker-no" data-t="s2.no"></span>
+            <span class="kicker-sep">/</span>
+            <span data-t="s2.kicker"></span>
+          </div>
+          <h1 id="s2-title" data-t="s2.title"></h1>
+          <p class="scene-lead" data-t="s2.lead"></p>
+        </div>
+        <span class="head-chip" data-t="s2.chip"></span>
+      </header>
+
+      <div class="scene-body s2-body">
+        <div class="way-grid">
+          <article class="way-card panel card-outlined" id="s2Disk">
+            <div class="way-head">
+              <div class="way-heading">
+                <span class="way-icon" aria-hidden="true"><svg class="md-icon"><use href="#i-storage"></use></svg></span>
+                <span class="way-label" data-t="s2.disk.label"></span>
+              </div>
+              <span class="tag" data-t="s2.disk.tag"></span>
+            </div>
+            <div class="way-visual" aria-hidden="true">
+              <div class="disk-stack">
+                <i class="disk-layer"></i>
+                <i class="disk-layer"></i>
+                <i class="disk-layer"></i>
+                <i class="disk-layer"></i>
+                <span class="disk-badge"><svg class="md-icon"><use href="#i-storage"></use></svg></span>
+              </div>
+            </div>
+            <div class="way-copy">
+              <div class="way-name" data-t="s2.disk.name"></div>
+              <div class="way-value" data-t="s2.disk.value"></div>
+              <div class="way-note" data-t="s2.disk.note"></div>
+            </div>
+          </article>
+
+          <div class="flow-column" aria-hidden="true">
+            <span class="flow-main" data-t="s2.flowRead.main"></span>
+            <span class="flow-sub" data-t="s2.flowRead.sub"></span>
+            <div class="flow-track">
+              <i class="flow-dot" id="s2DotA"></i>
+              <span class="flow-arrow"><svg class="md-icon"><use href="#i-arrow"></use></svg></span>
+            </div>
+          </div>
+
+          <article class="way-card panel is-core" id="s2Arena">
+            <div class="way-head">
+              <div class="way-heading">
+                <span class="way-icon secondary" aria-hidden="true"><svg class="md-icon"><use href="#i-memory"></use></svg></span>
+                <span class="way-label" data-t="s2.arena.label"></span>
+              </div>
+              <span class="tag" data-t="s2.arena.tag"></span>
+            </div>
+            <div class="way-visual" aria-hidden="true">
+              <div class="capacity-box">
+                <svg class="md-icon capacity-icon"><use href="#i-memory"></use></svg>
+                <div class="capacity-mark"><span></span><span></span></div>
+              </div>
+            </div>
+            <div class="way-copy">
+              <div class="way-name" data-t="s2.arena.name"></div>
+              <div class="way-value" data-t="s2.arena.value"></div>
+              <div class="way-note" data-t="s2.arena.note"></div>
+            </div>
+          </article>
+
+          <div class="flow-column" aria-hidden="true">
+            <span class="flow-main" data-t="s2.flowRun.main"></span>
+            <span class="flow-sub" data-t="s2.flowRun.sub"></span>
+            <div class="flow-track">
+              <i class="flow-dot" id="s2DotB"></i>
+              <span class="flow-arrow"><svg class="md-icon"><use href="#i-arrow"></use></svg></span>
+            </div>
+          </div>
+
+          <article class="way-card panel card-outlined" id="s2Cpu">
+            <div class="way-head">
+              <div class="way-heading">
+                <span class="way-icon tertiary" aria-hidden="true"><svg class="md-icon"><use href="#i-cpu"></use></svg></span>
+                <span class="way-label" data-t="s2.cpu.label"></span>
+              </div>
+              <span class="tag" data-t="s2.cpu.tag"></span>
+            </div>
+            <div class="way-visual" aria-hidden="true">
+              <div class="cpu-wrap">
+                <div class="cpu-chip">
+                  <span class="cpu-dots"></span>
+                  <svg class="md-icon"><use href="#i-cpu"></use></svg>
+                </div>
+                <i class="cpu-pulse" id="s2CpuPulse"></i>
+              </div>
+            </div>
+            <div class="way-copy">
+              <div class="way-name" data-t="s2.cpu.name"></div>
+              <div class="way-value" data-t="s2.cpu.value"></div>
+              <div class="way-note" data-t="s2.cpu.note"></div>
+            </div>
+          </article>
+        </div>
+
+        <div class="impl-strip" id="s2Strip"></div>
+      </div>
+    </section>
+
+    <!-- 03 64 层搬运 -->
+    <section class="scene" id="scene-3" data-scene="scene-3" aria-labelledby="s3-title">
+      <header class="scene-head">
+        <div class="scene-heading">
+          <div class="kicker">
+            <span class="kicker-icon" aria-hidden="true"><svg class="md-icon"><use href="#i-layers"></use></svg></span>
+            <span class="kicker-no" data-t="s3.no"></span>
+            <span class="kicker-sep">/</span>
+            <span data-t="s3.kicker"></span>
+          </div>
+          <h1 id="s3-title" data-t="s3.title"></h1>
+          <p class="scene-lead" data-t="s3.lead"></p>
+        </div>
+        <span class="head-chip" data-t="s3.chip"></span>
+      </header>
+
+      <div class="scene-body s3-body">
+        <!-- 输入输出 -->
+        <div class="io-strip">
+          <div class="io-side">
+            <span class="io-tag q" data-t="s3.io.qTag"></span>
+            <span class="io-question" data-t="s3.io.question"></span>
+            <span class="io-chips" id="s3PromptChips"></span>
+          </div>
+          <span class="io-arrow" aria-hidden="true"><svg class="md-icon"><use href="#i-arrow"></use></svg></span>
+          <div class="io-side answer">
+            <span class="io-tag a" data-t="s3.io.aTag"></span>
+            <span class="io-answer" id="s3Answer"><span id="s3AnswerTokens"></span><span class="io-caret" id="s3Caret"></span></span>
+          </div>
+          <div class="io-stats">
+            <span class="io-stat"><span data-t="s3.io.ppLabel"></span><b id="s3Pp">0</b></span>
+            <span class="io-stat"><span data-t="s3.io.tgLabel"></span><b id="s3Tg">0</b></span>
+            <span class="io-phase" id="s3Phase"></span>
+          </div>
+        </div>
+
+        <!-- 五块里的四块 -->
+        <div class="zones" id="s3Zones">
+          <section class="zone is-outlined">
+            <div class="zone-head">
+              <div class="zone-heading">
+                <span class="icon-tile" aria-hidden="true"><svg class="md-icon"><use href="#i-storage"></use></svg></span>
+                <div>
+                  <div class="zone-label" data-t="s3.disk.label"></div>
+                  <div class="zone-title" data-t="s3.disk.title"></div>
+                </div>
+              </div>
+              <span class="tag" data-t="s3.disk.tag"></span>
+            </div>
+            <div class="layer-grid" id="s3LayerGrid"></div>
+            <div class="zone-foot"><span data-t="s3.disk.foot"></span></div>
+          </section>
+
+          <section class="zone">
+            <div class="zone-head">
+              <div class="zone-heading">
+                <span class="icon-tile secondary" aria-hidden="true"><svg class="md-icon"><use href="#i-memory"></use></svg></span>
+                <div>
+                  <div class="zone-label" data-t="s3.mem.label"></div>
+                  <div class="zone-title" data-t="s3.mem.title"></div>
+                </div>
+              </div>
+              <span class="tag" data-t="s3.mem.tag"></span>
+            </div>
+            <div class="mem-grid" id="s3MemGrid"></div>
+            <div class="mem-meta">
+              <div class="mem-row">
+                <span class="mem-used" id="s3MemUsed"></span>
+                <span class="mem-evict" id="s3Evict" data-t="s3.mem.evict"></span>
+              </div>
+              <div class="mem-bar"><i id="s3MemFill"></i></div>
+            </div>
+            <div class="zone-foot"><span data-t="s3.mem.note"></span></div>
+          </section>
+
+          <section class="zone">
+            <div class="zone-head">
+              <div class="zone-heading">
+                <span class="icon-tile tertiary" aria-hidden="true"><svg class="md-icon"><use href="#i-cpu"></use></svg></span>
+                <div>
+                  <div class="zone-label" data-t="s3.cpu.label"></div>
+                  <div class="zone-title" data-t="s3.cpu.title"></div>
+                </div>
+              </div>
+              <span class="tag" data-t="s3.cpu.tag"></span>
+            </div>
+            <div class="cpu-visual" aria-hidden="true">
+              <svg class="cpu-ring" viewBox="0 0 120 120">
+                <circle class="ring-track" cx="60" cy="60" r="46"></circle>
+                <circle class="ring-arc" id="s3CpuArc" cx="60" cy="60" r="46"></circle>
+              </svg>
+              <div class="cpu-core" id="s3CpuCore">
+                <svg class="md-icon"><use href="#i-cpu"></use></svg>
+              </div>
+            </div>
+            <div class="cpu-range" id="s3CpuRange"></div>
+            <div class="cpu-sub" id="s3CpuStep"></div>
+            <div class="cpu-lanes" id="s3CpuLanes" aria-hidden="true"></div>
+            <div class="zone-foot">
+              <span data-t="s3.cpu.foot"></span>
+              <b id="s3Batch"></b>
+            </div>
+          </section>
+
+          <section class="zone">
+            <div class="zone-head">
+              <div class="zone-heading">
+                <span class="icon-tile" aria-hidden="true"><svg class="md-icon"><use href="#i-token"></use></svg></span>
+                <div>
+                  <div class="zone-label" data-t="s3.kv.label"></div>
+                  <div class="zone-title" data-t="s3.kv.title"></div>
+                </div>
+              </div>
+              <span class="tag" data-t="s3.kv.tag"></span>
+            </div>
+            <div class="kv-grid" id="s3KvGrid"></div>
+            <div class="zone-foot"><span data-t="s3.kv.foot"></span></div>
+          </section>
+
+          <div class="zone-fly" id="s3Fly" aria-hidden="true"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 04 小结 -->
+    <section class="scene" id="scene-4" data-scene="scene-4" aria-labelledby="s4-title">
+      <header class="scene-head">
+        <div class="scene-heading">
+          <div class="kicker">
+            <span class="kicker-icon" aria-hidden="true"><svg class="md-icon"><use href="#i-check-circle"></use></svg></span>
+            <span class="kicker-no" data-t="s4.no"></span>
+            <span class="kicker-sep">/</span>
+            <span data-t="s4.kicker"></span>
+          </div>
+          <h1 id="s5-title" data-t="s4.title"></h1>
+          <p class="scene-lead" data-t="s4.lead"></p>
+        </div>
+      </header>
+
+      <div class="scene-body final-body">
+        <div class="final-copy">
+          <div class="summary-list" id="s4Summary"></div>
+        </div>
+        <div class="final-art" aria-hidden="true">
+          <span class="final-orb">
+            <svg class="md-icon"><use href="#i-storage"></use></svg>
+          </span>
+          <span class="final-orb-chip">
+            <svg class="md-icon"><use href="#i-speed"></use></svg>
+          </span>
+        </div>
+        <div class="final-close" id="s4Close">
+          <span class="final-close-icon" aria-hidden="true"><svg class="md-icon"><use href="#i-check-circle"></use></svg></span>
+          <span class="final-close-text" data-t="s4.close"></span>
+          <span class="final-credit" data-t="s4.brand"></span>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <footer class="footer">
+    <span class="footer-hint">
+      <i class="live-dot" aria-hidden="true"></i>
+      <span data-t="chrome.footerHint"></span>
+    </span>
+    <span class="footer-meta">
+      <span id="sceneCounter"></span>
+      <span class="footer-sep">·</span>
+      <span id="timecode"></span>
+    </span>
+  </footer>
+  <div class="timeline-track" aria-hidden="true">
+    <i class="timeline-fill" id="timelineFill"></i>
+    <div class="timeline-notches" id="timelineNotches"></div>
+  </div>
+</main>
+
+<script>
+
+(() => {
+  'use strict';
+
+  /* ============================================================
+     1. 基础工具
+     ============================================================ */
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+  const clamp01 = value => clamp(value, 0, 1);
+
+  // M3 emphasized / standard easing，供逐帧时间轴使用。
+  const cubicBezier = (x1, y1, x2, y2) => {
+    const cx = 3 * x1;
+    const bx = 3 * (x2 - x1) - cx;
+    const ax = 1 - cx - bx;
+    const cy = 3 * y1;
+    const by = 3 * (y2 - y1) - cy;
+    const ay = 1 - cy - by;
+    const sampleX = t => ((ax * t + bx) * t + cx) * t;
+    const sampleY = t => ((ay * t + by) * t + cy) * t;
+    const sampleDX = t => (3 * ax * t + 2 * bx) * t + cx;
+    return value => {
+      if (value <= 0) return 0;
+      if (value >= 1) return 1;
+      let t = value;
+      for (let i = 0; i < 5; i += 1) {
+        const delta = sampleX(t) - value;
+        if (Math.abs(delta) < 1e-5) break;
+        const slope = sampleDX(t);
+        if (Math.abs(slope) < 1e-6) break;
+        t = clamp01(t - delta / slope);
+      }
+      return clamp01(sampleY(t));
+    };
+  };
+  const smooth = value => {
+    const v = clamp01(value);
+    return v * v * (3 - 2 * v);
+  };
+  const easeOut = cubicBezier(.2, 0, 0, 1);
+  const emphasized = cubicBezier(.05, .7, .1, 1);
+  const lerp = (a, b, p) => a + (b - a) * p;
+  const pad2 = value => String(value).padStart(2, '0');
+  const fmt = (template, values) => template.replace(/\{(\w+)\}/g, (_, key) => (
+    Object.prototype.hasOwnProperty.call(values, key) ? values[key] : ''
+  ));
+  const readPath = path => path.split('.').reduce((node, key) => (
+    node == null ? undefined : node[key]
+  ), TEXT);
+  const setTransform = (el, value) => { el.style.transform = value; };
+  const stageEl = $('#stage');
+
+  // 动态循环里统一用 inline SVG 图标，保持 Material Symbols Rounded 的线条风格。
+  const mdIcon = (id, className = 'md-icon') => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('class', className);
+    svg.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', `#${id}`);
+    svg.appendChild(use);
+    return svg;
+  };
+
+  // MD3 emphasized decelerate：用于位移与入场，不改变进度本身的时间映射。
+  const enter = (el, p, base = .90, distance = 1.2) => {
+    const e = emphasized(p);
+    el.style.opacity = String(base + (1 - base) * e);
+    setTransform(el, `translate3d(0, ${((1 - e) * distance).toFixed(3)}cqw, 0)`);
+  };
+
+  const span = (label, start, end, time) => clamp01((time - start) / (end - start));
+
+  /* ============================================================
+     2. TEXT 落到 DOM + 动态列表
+     ============================================================ */
+  function hydrateText() {
+    document.title = TEXT.docTitle;
+    stageEl.setAttribute('aria-label', TEXT.stageLabel);
+    $$('[data-t]').forEach(el => {
+      const value = readPath(el.dataset.t);
+      if (value !== undefined && value !== null) el.textContent = value;
+    });
+  }
+
+  function buildTimeline() {
+    let cursor = 0;
+    const segments = TIMELINE.map(item => {
+      const durMs = Math.max(0, Number(item.dur) || 0);
+      const segment = {
+        id: item.id,
+        durMs,
+        start: cursor / 1000,
+        end: (cursor + durMs) / 1000,
+        durSec: durMs / 1000
+      };
+      cursor += durMs;
+      return segment;
+    });
+    return { segments, totalSec: cursor / 1000 };
+  }
+
+  function buildTimelineNotches(segments, totalSec) {
+    const host = $('#timelineNotches');
+    if (!host || totalSec <= 0) return;
+    segments.forEach(segment => {
+      const notch = document.createElement('div');
+      notch.className = 'timeline-notch';
+      notch.style.width = `${(segment.durMs / (totalSec * 1000)) * 100}%`;
+      host.appendChild(notch);
+    });
+  }
+
+  function buildImplStrip() {
+    const host = $('#s2Strip');
+    TEXT.s2.strip.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'impl-item';
+      const iconWrap = document.createElement('span');
+      iconWrap.className = 'impl-icon';
+      iconWrap.appendChild(mdIcon(item.icon));
+      const code = document.createElement('span');
+      code.className = 'impl-code';
+      code.textContent = item.code;
+      const text = document.createElement('span');
+      text.className = 'impl-text';
+      text.textContent = item.text;
+      row.append(iconWrap, code, text);
+      host.appendChild(row);
+    });
+  }
+
+  // 64 层网格 + 8 个驻留块 + 8 个飞行块 + 8 条计算条 + 6 列 KV
+  function buildScene3() {
+    const cellHost = $('#s3LayerGrid');
+    const cells = [];
+    for (let i = 0; i < 64; i += 1) {
+      const cell = document.createElement('i');
+      cell.className = 'layer-cell';
+      cell.textContent = pad2(i);
+      cellHost.appendChild(cell);
+      cells.push(cell);
+    }
+
+    const memHost = $('#s3MemGrid');
+    const slots = [];
+    for (let i = 0; i < 8; i += 1) {
+      const slot = document.createElement('div');
+      slot.className = 'mem-slot';
+      const block = document.createElement('div');
+      block.className = 'mem-block';
+      const name = document.createElement('span');
+      name.className = 'mem-name';
+      const pin = document.createElement('span');
+      pin.className = 'mem-pin';
+      pin.textContent = 'pin';
+      block.append(name, pin);
+      slot.appendChild(block);
+      memHost.appendChild(slot);
+      slots.push({ slot, block, name });
+    }
+
+    const flyHost = $('#s3Fly');
+    const flies = [];
+    for (let i = 0; i < 8; i += 1) {
+      const fly = document.createElement('div');
+      fly.className = 'fly-block';
+      flyHost.appendChild(fly);
+      flies.push(fly);
+    }
+
+    const laneHost = $('#s3CpuLanes');
+    const lanes = [];
+    for (let i = 0; i < 8; i += 1) {
+      const lane = document.createElement('div');
+      lane.className = 'cpu-lane';
+      const fill = document.createElement('i');
+      lane.appendChild(fill);
+      laneHost.appendChild(lane);
+      lanes.push(fill);
+    }
+
+    const kvHost = $('#s3KvGrid');
+    const kvCols = TEXT.s3.kv.tokens.map((label, index) => {
+      const col = document.createElement('div');
+      col.className = 'kv-col';
+      if (index >= 3) col.classList.add('is-gen');
+      if (index === 3) col.classList.add('is-gen-start');
+      const track = document.createElement('div');
+      track.className = 'kv-track';
+      const fill = document.createElement('i');
+      track.appendChild(fill);
+      const tag = document.createElement('span');
+      tag.className = 'kv-label';
+      tag.textContent = label;
+      col.append(track, tag);
+      kvHost.appendChild(col);
+      return { fill, label: tag };
+    });
+
+    const promptHost = $('#s3PromptChips');
+    const promptChips = TEXT.s3.io.promptTokens.map((token, index) => {
+      const chip = document.createElement('span');
+      chip.className = 'io-chip';
+      const no = document.createElement('b');
+      no.textContent = pad2(index + 1);
+      const text = document.createElement('span');
+      text.textContent = token;
+      chip.append(no, text);
+      promptHost.appendChild(chip);
+      return chip;
+    });
+
+    const answerHost = $('#s3AnswerTokens');
+    const answerTokens = TEXT.s3.io.answerTokens.map(token => {
+      const el = document.createElement('span');
+      el.className = 'io-token';
+      el.textContent = token;
+      answerHost.appendChild(el);
+      return el;
+    });
+
+    return { cells, slots, flies, lanes, kvCols, promptChips, answerTokens };
+  }
+
+  function buildScene4() {
+    const host = $('#s4Summary');
+    const items = [];
+    TEXT.s4.items.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'summary-item';
+      const iconWrap = document.createElement('span');
+      iconWrap.className = `summary-icon${item.tone ? ` ${item.tone}` : ''}`;
+      iconWrap.setAttribute('aria-hidden', 'true');
+      iconWrap.appendChild(mdIcon(item.icon));
+      const textWrap = document.createElement('span');
+      textWrap.className = 'summary-text-wrap';
+      const no = document.createElement('span');
+      no.className = 'summary-no';
+      no.textContent = item.n;
+      let body;
+      if (item.formula) {
+        // 公式也是原理的一部分：速度 ≈ 带宽 ÷ 模型大小。
+        body = document.createElement('span');
+        body.className = 'summary-formula';
+        item.formula.forEach(part => {
+          const piece = document.createElement('span');
+          piece.textContent = part.text;
+          if (part.op) piece.className = 'op';
+          else if (part.tone) piece.className = `term ${part.tone}`;
+          body.appendChild(piece);
+        });
+      } else {
+        body = document.createElement('span');
+        body.className = 'summary-text';
+        body.textContent = item.text;
+      }
+      textWrap.append(no, body);
+      row.append(iconWrap, textWrap);
+      host.appendChild(row);
+      items.push(row);
+    });
+    return items;
+  }
+
+  /* ============================================================
+     3. 初始化数据与引用
+     ============================================================ */
+  hydrateText();
+  const timelineData = buildTimeline();
+  const segments = timelineData.segments;
+  const totalSec = timelineData.totalSec;
+  buildTimelineNotches(segments, totalSec);
+  buildImplStrip();
+  const s3Built = buildScene3();
+  const s4Items = buildScene4();
+
+  const ui = {
+    timecode: $('#timecode'),
+    sceneCounter: $('#sceneCounter'),
+    timelineFill: $('#timelineFill'),
+    scenes: $$('.scene')
+  };
+
+  const s1 = {
+    model: $('#s1Model'),
+    memory: $('#s1Memory'),
+    modelFill: $('#s1ModelFill'),
+    memoryFill: $('#s1MemoryFill'),
+    routes: $$('.s1-routes .route-card'),
+    strikes: [$('#s1Strike0'), $('#s1Strike1')],
+    xs: [$('#s1X0'), $('#s1X1')],
+    shortfall: $('.shortfall')
+  };
+
+  const s2 = {
+    disk: $('#s2Disk'),
+    arena: $('#s2Arena'),
+    cpu: $('#s2Cpu'),
+    dotA: $('#s2DotA'),
+    dotB: $('#s2DotB'),
+    cpuPulse: $('#s2CpuPulse'),
+    stripItems: $$('#s2Strip .impl-item')
+  };
+
+  const s3 = {
+    ...s3Built,
+    pp: $('#s3Pp'),
+    tg: $('#s3Tg'),
+    phase: $('#s3Phase'),
+    caret: $('#s3Caret'),
+    memUsed: $('#s3MemUsed'),
+    evict: $('#s3Evict'),
+    memFill: $('#s3MemFill'),
+    cpuArc: $('#s3CpuArc'),
+    cpuCore: $('#s3CpuCore'),
+    cpuRange: $('#s3CpuRange'),
+    cpuStep: $('#s3CpuStep'),
+    batch: $('#s3Batch'),
+    flyLayer: $('#s3Fly')
+  };
+
+  // 64 层演示的时间轴（场景内毫秒）：prefill 一轮 + decode 两轮。
+  const DEMO3 = {
+    total: 11500,
+    intro: 200,
+    passes: [
+      { kind: 'prefill', start: 600, dur: 3840, batch: 3, kv: [0, 1, 2] },
+      { kind: 'decode', start: 4440, dur: 2880, batch: 1, kv: [3] },
+      { kind: 'decode', start: 7320, dur: 2880, batch: 1, kv: [4] }
+    ],
+    tokenTimes: [4320, 7240, 10120],
+    tail: { start: 10200, end: 10740, col: 5 },
+    done: 10740
+  };
+
+  const S3WIN = {
+    flyOffset: .04,
+    flyStagger: .015,
+    flyDur: .44,
+    computeOffset: .54,
+    computeDur: .26,
+    kvOffset: .58,
+    kvDur: .34,
+    evict: .34
+  };
+
+  const s4 = {
+    items: s4Items,
+    close: $('#s4Close'),
+    art: $('.final-art')
+  };
+
+  const memoryRatio = .24;
+  let reduced = false;
+  let forcedTime = null;
+  let speed = 1;
+  let shouldLoop = false;
+
+  function readQuery() {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('t')) {
+      const value = parseFloat(params.get('t'));
+      if (Number.isFinite(value)) forcedTime = clamp(value, 0, totalSec);
+    }
+    if (params.has('speed')) {
+      const value = parseFloat(params.get('speed'));
+      if (Number.isFinite(value) && value > 0) speed = clamp(value, .1, 8);
+    }
+    shouldLoop = params.get('loop') === '1';
+    reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+
+  /* ============================================================
+     4. 每段动画
+     ============================================================ */
+  function renderScene1(u) {
+    enter(s1.model, span(null, 0, .22, u), .92, 1.25);
+    enter(s1.memory, span(null, .04, .26, u), .92, 1.25);
+    enter(s1.routes[0], span(null, .12, .38, u), .93, 1.5);
+    enter(s1.routes[1], span(null, .18, .44, u), .93, 1.5);
+
+    const modelFill = easeOut(span(null, .04, .36, u));
+    const memoryFill = easeOut(span(null, .20, .46, u)) * memoryRatio;
+    s1.modelFill.style.transform = `scaleX(${modelFill})`;
+    s1.memoryFill.style.transform = `scaleX(${memoryFill})`;
+
+    const cross = easeOut(span(null, .40, .60, u));
+    s1.strikes.forEach(strike => {
+      strike.style.transform = `scaleX(${cross})`;
+    });
+    s1.xs.forEach(x => {
+      x.style.opacity = String(.45 + cross * .45);
+    });
+    s1.shortfall.style.opacity = String(span(null, .26, .46, u));
+  }
+
+  function renderScene2(u) {
+    enter(s2.disk, span(null, 0, .24, u), .92, 1.3);
+    enter(s2.arena, span(null, .04, .28, u), .92, 1.3);
+    enter(s2.cpu, span(null, .08, .32, u), .92, 1.3);
+
+    const pA = span(null, .18, .35, u);
+    const pB = span(null, .37, .54, u);
+    const dotVisibility = p => {
+      if (p <= 0 || p >= 1) return 0;
+      return Math.min(1, p * 7, (1 - p) * 7);
+    };
+    s2.dotA.style.left = `${smooth(pA) * 100}%`;
+    s2.dotA.style.opacity = String(dotVisibility(pA));
+    s2.dotB.style.left = `${smooth(pB) * 100}%`;
+    s2.dotB.style.opacity = String(dotVisibility(pB));
+
+    const pulse = span(null, .53, .72, u);
+    const pulseOpacity = pulse > 0 && pulse < 1 ? Math.sin(Math.PI * pulse) : 0;
+    s2.cpuPulse.style.opacity = String(pulseOpacity * .9);
+    s2.cpuPulse.style.transform = `translate(2.45cqw, -1.7cqw) scale(${.7 + pulse * 1.2})`;
+
+    s2.stripItems.forEach((item, index) => {
+      enter(item, span(null, 0, .20 + index * .055, u), .86, .5);
+    });
+  }
+
+  function s3KvRows(col, t) {
+    const [prefill, decode1, decode2] = DEMO3.passes;
+    const fill = pass => {
+      const stepDur = pass.dur / 8;
+      const local = clamp(t - pass.start, 0, pass.dur);
+      const step = Math.min(7, Math.floor(local / stepDur));
+      const stepStart = pass.start + step * stepDur;
+      const kvP = smooth(span(null,
+        stepStart + S3WIN.kvOffset * stepDur,
+        stepStart + (S3WIN.kvOffset + S3WIN.kvDur) * stepDur,
+        t));
+      return Math.min(64, (step + kvP) * 8);
+    };
+    if (col < 3) {
+      if (t >= prefill.start + prefill.dur) return 64;
+      if (t >= prefill.start) return fill(prefill);
+      return 0;
+    }
+    if (col === 3) {
+      if (t >= decode1.start + decode1.dur) return 64;
+      if (t >= decode1.start) return fill(decode1);
+      return 0;
+    }
+    if (col === 4) {
+      if (t >= decode2.start + decode2.dur) return 64;
+      if (t >= decode2.start) return fill(decode2);
+      return 0;
+    }
+    if (t >= DEMO3.tail.end) return 64;
+    if (t >= DEMO3.tail.start) {
+      return smooth(span(null, DEMO3.tail.start, DEMO3.tail.end, t)) * 64;
+    }
+    return 0;
+  }
+
+  function renderScene3(u) {
+    const t = clamp(u * DEMO3.total, 0, DEMO3.total);
+
+    // 问题 token
+    s3.promptChips.forEach((chip, index) => {
+      const start = DEMO3.intro + index * 110;
+      const p = smooth(span(null, start, start + 240, t));
+      chip.style.opacity = String(p);
+      chip.style.transform = `translate3d(0, ${((1 - p) * .4).toFixed(3)}cqw, 0)`;
+    });
+
+    // 回答 token
+    let emitted = 0;
+    s3.answerTokens.forEach((el, index) => {
+      const at = DEMO3.tokenTimes[index];
+      if (t >= at) emitted = index + 1;
+      const p = smooth(span(null, at, at + 280, t));
+      el.classList.toggle('is-on', t >= at);
+      el.style.opacity = String(p);
+      el.style.transform = `translate3d(0, ${((1 - p) * .35).toFixed(3)}cqw, 0)`;
+    });
+    s3.tg.textContent = String(emitted);
+
+    // pp 3
+    const ppP = smooth(span(null, DEMO3.passes[0].start + 250, DEMO3.passes[0].start + 900, t));
+    s3.pp.textContent = String(Math.round(3 * ppP));
+
+    const done = t >= DEMO3.done;
+    const blink = .5 + .5 * Math.sin(t / 170);
+    s3.caret.style.opacity = String(done ? .45 : emitted > 0 ? .6 + blink * .4 : .25 + blink * .35);
+
+    // 当前那一遍 / 那一组 8 层
+    let pass = null;
+    let passIndex = -1;
+    for (let i = 0; i < DEMO3.passes.length; i += 1) {
+      const item = DEMO3.passes[i];
+      if (t >= item.start && t < item.start + item.dur) {
+        pass = item;
+        passIndex = i;
+        break;
+      }
+    }
+
+    let base = -1;
+    let step = 0;
+    let stepDur = 0;
+    let stepStart = 0;
+    if (pass) {
+      stepDur = pass.dur / 8;
+      const local = t - pass.start;
+      step = Math.min(7, Math.floor(local / stepDur));
+      stepStart = pass.start + step * stepDur;
+      base = step * 8;
+    }
+
+    // 磁盘 64 格：读头一格一格前移，搬完的层变暗
+    const cqw = stageEl.clientWidth / 100;
+    let flyWindows = [];
+    if (pass) {
+      flyWindows = Array.from({ length: 8 }, (_, i) => {
+        const start = stepStart + (S3WIN.flyOffset + i * S3WIN.flyStagger) * stepDur;
+        return { start, end: start + S3WIN.flyDur * stepDur };
+      });
+    }
+    s3.cells.forEach((cell, index) => {
+      const row = Math.floor(index / 8);
+      const col = index % 8;
+      let read = !!pass && index < base;
+      let current = false;
+      if (pass && row === step) {
+        const win = flyWindows[col];
+        current = t >= win.start && t < win.end;
+        read = read || t >= win.end;
+      }
+      cell.classList.toggle('is-read', read);
+      cell.classList.toggle('is-current', current);
+    });
+
+    // 内存 8 槽 + 飞行块
+    s3.flies.forEach(fly => { fly.style.opacity = '0'; });
+    if (pass) {
+      const leadFly = flyWindows[0];
+      s3.evict.style.opacity = String(t >= leadFly.start && t < leadFly.end ? 1 : 0);
+      s3.memUsed.textContent = fmt(TEXT.s3.mem.used, { n: 8 });
+      s3.memFill.style.transform = 'scaleX(1)';
+      const flyRect = s3.flyLayer.getBoundingClientRect();
+
+      s3.slots.forEach((slot, index) => {
+        const win = flyWindows[index];
+        const flyStart = win.start;
+        const flyEnd = win.end;
+        const arriveP = smooth(span(null, flyEnd, flyEnd + .09 * stepDur, t));
+        const prevBase = step > 0 ? base - 8 : passIndex > 0 ? 56 : -1;
+        const evictP = smooth(span(null, flyEnd - .18 * stepDur, flyEnd, t));
+        const evicting = prevBase >= 0 && t < flyEnd && evictP > .02;
+        const opacity = t >= flyEnd ? arriveP : prevBase >= 0 ? 1 - evictP : 0;
+        slot.block.classList.toggle('is-evict', evicting);
+        slot.block.style.opacity = String(opacity.toFixed(3));
+
+        if (evicting) {
+          slot.block.style.transform = `translate3d(${(-.5 * evictP).toFixed(3)}cqw, 0, 0) scale(${(1 - .04 * evictP).toFixed(3)})`;
+        } else if (t >= flyEnd) {
+          slot.block.style.transform = `translate3d(0, ${((1 - arriveP) * .6).toFixed(3)}cqw, 0) scale(${(.96 + .04 * arriveP).toFixed(3)})`;
+        } else {
+          slot.block.style.transform = 'translate3d(0, 0, 0) scale(1)';
+        }
+
+        slot.name.textContent = t < flyEnd && prevBase >= 0
+          ? `L${pad2(prevBase + index)}`
+          : `L${pad2(base + index)}`;
+
+        if (t >= flyStart && t < flyEnd) {
+          const from = s3.cells[base + index].getBoundingClientRect();
+          const to = slot.slot.getBoundingClientRect();
+          if (!from.width || !to.width) return;
+          const size = Math.min(from.width, from.height) * .92;
+          const raw = clamp01((t - flyStart) / (flyEnd - flyStart));
+          const eased = emphasized(raw);
+          const sx = from.left - flyRect.left + (from.width - size) / 2;
+          const sy = from.top - flyRect.top + (from.height - size) / 2;
+          const tx = to.left - flyRect.left + (to.width - size) / 2;
+          const ty = to.top - flyRect.top + (to.height - size) / 2;
+          const dx = tx - sx;
+          const dy = ty - sy;
+          const len = Math.hypot(dx, dy) || 1;
+          const nx = dy / len;
+          const ny = -dx / len;
+          const curve = Math.sin(Math.PI * raw) * Math.min(cqw * 2, len * .2);
+          const x = lerp(sx, tx, eased) + nx * curve;
+          const y = lerp(sy, ty, eased) + ny * curve;
+          const scale = .9 + .1 * eased + .05 * Math.sin(Math.PI * raw);
+          const fly = s3.flies[index];
+          fly.textContent = `L${pad2(base + index)}`;
+          fly.style.width = `${size.toFixed(1)}px`;
+          fly.style.height = `${size.toFixed(1)}px`;
+          fly.style.opacity = String(Math.max(0, Math.min(1, raw / .1, (1 - raw) / .12)));
+          fly.style.transform = `translate3d(${x.toFixed(2)}px, ${y.toFixed(2)}px, 0) scale(${scale.toFixed(3)})`;
+        }
+      });
+    } else {
+      const showLast = t >= DEMO3.passes[0].start;
+      s3.evict.style.opacity = '0';
+      s3.memUsed.textContent = fmt(TEXT.s3.mem.used, { n: showLast ? 8 : 0 });
+      s3.memFill.style.transform = `scaleX(${showLast ? 1 : 0})`;
+      s3.slots.forEach((slot, index) => {
+        slot.block.style.opacity = showLast ? '1' : '0';
+        slot.name.textContent = showLast ? `L${pad2(56 + index)}` : '';
+      });
+    }
+
+    // CPU 计算条
+    if (pass) {
+      const computeStart = stepStart + S3WIN.computeOffset * stepDur;
+      const computeEnd = computeStart + S3WIN.computeDur * stepDur;
+      s3.cpuRange.textContent = fmt(TEXT.s3.cpu.range, { from: pad2(base), to: pad2(base + 7) });
+      s3.cpuStep.textContent = fmt(TEXT.s3.cpu.group, { n: step + 1 });
+      s3.batch.textContent = fmt(TEXT.s3.cpu.batch, { n: pass.batch });
+      const coreP = clamp01((t - computeStart) / (computeEnd - computeStart));
+      s3.lanes.forEach((lane, index) => {
+        const p = clamp01((t - (computeStart + index * .012 * stepDur)) / (.26 * stepDur));
+        lane.style.height = `${(smooth(p) * 100).toFixed(1)}%`;
+      });
+      s3.cpuCore.style.transform = `scale(${(1 + Math.sin(Math.PI * clamp01(coreP)) * .04).toFixed(4)})`;
+      s3.cpuArc.style.strokeDashoffset = String(289.03 * (1 - clamp01((t - pass.start) / pass.dur)));
+    } else {
+      const started = t >= DEMO3.passes[0].start;
+      s3.cpuRange.textContent = fmt(TEXT.s3.cpu.range, {
+        from: started ? '56' : '00',
+        to: started ? '63' : '07'
+      });
+      s3.cpuStep.textContent = started ? fmt(TEXT.s3.cpu.group, { n: 8 }) : '';
+      s3.batch.textContent = fmt(TEXT.s3.cpu.batch, { n: started ? 1 : 3 });
+      s3.lanes.forEach(lane => { lane.style.height = started ? '100%' : '0%'; });
+      s3.cpuCore.style.transform = 'scale(1)';
+      s3.cpuArc.style.strokeDashoffset = String(289.03 * (1 - (started ? 1 : 0)));
+    }
+
+    // KV 6 列
+    s3.kvCols.forEach((col, index) => {
+      const rows = s3KvRows(index, t);
+      col.fill.style.height = `${((rows / 64) * 100).toFixed(2)}%`;
+      col.label.style.opacity = rows > 0 ? '1' : '.55';
+    });
+
+    // 阶段
+    let phaseText = TEXT.s3.io.phaseIdle;
+    let phaseClass = '';
+    if (pass) {
+      if (pass.kind === 'prefill') {
+        phaseText = TEXT.s3.io.phasePrefill;
+        phaseClass = 'is-prefill';
+      } else {
+        phaseText = fmt(TEXT.s3.io.phaseDecode, { n: passIndex + 1 });
+        phaseClass = 'is-decode';
+      }
+    } else if (t >= DEMO3.done) {
+      phaseText = TEXT.s3.io.phaseDone;
+    } else if (t >= DEMO3.tail.start) {
+      phaseText = fmt(TEXT.s3.io.phaseDecode, { n: 3 });
+      phaseClass = 'is-decode';
+    }
+    s3.phase.textContent = phaseText;
+    s3.phase.className = `io-phase${phaseClass ? ` ${phaseClass}` : ''}`;
+  }
+
+  function renderScene4(u) {
+    s4.items.forEach((item, index) => {
+      const p = smooth(span(null, index * .05, .16 + index * .05, u));
+      item.style.opacity = String(.75 + p * .25);
+      item.style.transform = `translate3d(0, ${((1 - p) * 1.1).toFixed(3)}cqw, 0)`;
+    });
+
+    // 最后一句：内存不再限制模型大小。
+    const closeP = smooth(span(null, .22, .40, u));
+    s4.close.style.opacity = String(.7 + closeP * .3);
+    s4.close.style.transform = `translate3d(0, ${((1 - closeP) * .7).toFixed(3)}cqw, 0)`;
+
+    const artP = smooth(span(null, .04, .34, u));
+    s4.art.style.opacity = String(.55 + artP * .45);
+  }
+
+  /* ============================================================
+     5. 场景切换、时钟、启动
+     ============================================================ */
+  function sceneIndexAt(time) {
+    for (let index = 0; index < segments.length; index += 1) {
+      if (time < segments[index].end - 1e-7) return index;
+    }
+    return Math.max(0, segments.length - 1);
+  }
+
+  function formatTime(seconds) {
+    const value = Math.max(0, Math.floor(seconds + 1e-7));
+    const minutes = Math.floor(value / 60);
+    const rest = value % 60;
+    return `${pad2(minutes)}:${pad2(rest)}`;
+  }
+
+  function updateChrome(time, index) {
+    const clampedTime = clamp(time, 0, totalSec);
+    if (ui.timecode) {
+      ui.timecode.textContent = fmt(TEXT.chrome.timePattern, {
+        now: formatTime(clampedTime),
+        total: formatTime(totalSec)
+      });
+    }
+    if (ui.sceneCounter) {
+      ui.sceneCounter.textContent = fmt(TEXT.chrome.scenePattern, {
+        n: pad2(index + 1),
+        total: pad2(segments.length)
+      });
+    }
+    if (ui.timelineFill && totalSec > 0) {
+      ui.timelineFill.style.width = `${(clampedTime / totalSec) * 100}%`;
+    }
+  }
+
+  const state = {
+    time: 0,
+    currentScene: -1,
+    playing: false,
+    lastStamp: null
+  };
+
+  function render(time) {
+    if (!segments.length) return;
+    const safeTime = clamp(time, 0, totalSec);
+    const index = sceneIndexAt(safeTime);
+    const segment = segments[index];
+    const local = safeTime >= totalSec
+      ? segment.durSec
+      : clamp(safeTime - segment.start, 0, segment.durSec);
+    const u = segment.durSec > 0 ? clamp01(local / segment.durSec) : 1;
+
+    if (index !== state.currentScene) {
+      ui.scenes.forEach((scene, sceneIndex) => {
+        const active = sceneIndex === index;
+        scene.classList.toggle('is-active', active);
+        scene.setAttribute('aria-hidden', active ? 'false' : 'true');
+      });
+      state.currentScene = index;
+    }
+
+    updateChrome(safeTime, index);
+    if (index === 0) renderScene1(u);
+    else if (index === 1) renderScene2(u);
+    else if (index === 2) renderScene3(u);
+    else if (index === 3) renderScene4(u);
+
+    state.time = safeTime;
+  }
+
+  function tick(stamp) {
+    if (!state.playing) return;
+    if (state.lastStamp === null) state.lastStamp = stamp;
+    let dt = (stamp - state.lastStamp) / 1000;
+    state.lastStamp = stamp;
+    if (!Number.isFinite(dt) || dt < 0) dt = 0;
+    if (dt > .25) dt = .1;
+
+    state.time += dt * speed;
+
+    if (state.time >= totalSec) {
+      if (shouldLoop) {
+        state.time = totalSec > 0 ? state.time % totalSec : 0;
+        render(state.time);
+        requestAnimationFrame(tick);
+        return;
+      }
+      state.time = totalSec;
+      state.playing = false;
+      state.lastStamp = null;
+      render(totalSec);
+      return;
+    }
+
+    render(state.time);
+    requestAnimationFrame(tick);
+  }
+
+  function start() {
+    readQuery();
+
+    // ?t=... 优先：静态停在该时刻。reduced-motion 若没有显式 t，则直接到最终帧。
+    if (forcedTime !== null) {
+      state.playing = false;
+      state.time = forcedTime;
+      render(forcedTime);
+      return;
+    }
+    if (reduced) {
+      state.playing = false;
+      render(totalSec);
+      return;
+    }
+
+    state.playing = true;
+    state.time = 0;
+    render(0);
+    state.lastStamp = null;
+    requestAnimationFrame(tick);
+  }
+
+  // 字体、尺寸稳定后再补一帧，保证 ?t= 截图定位准确。
+  const rerenderStatic = () => {
+    if (!state.playing) render(state.time);
+  };
+  window.addEventListener('load', rerenderStatic);
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(rerenderStatic);
+  }
+  window.addEventListener('resize', () => {
+    requestAnimationFrame(rerenderStatic);
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) state.lastStamp = null;
+  });
+
+  start();
+})();
+
+</script>
+</body>
+</html>

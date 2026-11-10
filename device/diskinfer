@@ -1,90 +1,351 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# diskinfer [question]
-# diskinfer -m /path/model.gguf [--arena MiB] [question] [engine args]
+# diskinfer - android launcher for the disk-streaming llama fork
+#
+#   diskinfer                       open the TUI (model picker / settings page)
+#   diskinfer -m /path/model.gguf [engine args...]
+#   diskinfer --api-only -m model   headless /v1 API on port 4000
+#   diskinfer -l                    list the models found
+#
+# the engine flags (-n -c -t -ub --temp --top-k --top-p --raw --chat --sys,
+# --arena MiB, --api-only, --n-ctx, --lang ...) are passed through to disktui
+# untouched. this launcher only: finds a model, exports DISKINFER_MODEL_DIRS,
+# and re-execs the engine through run_as_root.sh when the phone is rooted.
+#
+# messages: en / zh-Hans / zh-Hant, auto-detected (contract v5 §1.3):
+#   --lang CLI > DISKINFER_LANG > getprop persist.sys.locale > ro.product.locale > $LANG > $LC_ALL
 
 # make sure the termux tools are reachable even from a bare shell
 export PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH
 
+# ---------------------------------------------------------------------------
+# i18n
+# ---------------------------------------------------------------------------
+lang_from_tag() {
+  tag=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$tag" in
+    *hant*|*tw*|*hk*|*mo*) printf '%s' zh-hant ;;
+    zh*)                   printf '%s' zh-hans ;;
+    *)                     printf '%s' en ;;
+  esac
+}
+
+probe_system_lang() {
+  probe=""
+  # on android the phone's language is the product locale; Termux may export its
+  # own LANG (en_US.UTF-8 by default) which has nothing to do with the device
+  # setting, so the system properties win (same order as the TUI i18n.cpp)
+  if command -v getprop >/dev/null 2>&1; then
+    probe=$(getprop persist.sys.locale 2>/dev/null)
+  elif [ -x /system/bin/getprop ]; then
+    probe=$(/system/bin/getprop persist.sys.locale 2>/dev/null)
+  fi
+  if [ -z "$probe" ]; then
+    if command -v getprop >/dev/null 2>&1; then
+      probe=$(getprop ro.product.locale 2>/dev/null)
+    elif [ -x /system/bin/getprop ]; then
+      probe=$(/system/bin/getprop ro.product.locale 2>/dev/null)
+    fi
+  fi
+  [ -z "$probe" ] && probe=${LANG:-}
+  [ -z "$probe" ] && probe=${LC_ALL:-}
+  printf '%s' "$probe"
+}
+
+detect_lang() {
+  explicit=${1:-}
+  if [ -z "$explicit" ] && [ -n "${DISKINFER_LANG:-}" ]; then
+    explicit=$DISKINFER_LANG
+  fi
+  if [ -z "$explicit" ]; then
+    explicit=$(probe_system_lang)
+  fi
+  lang_from_tag "$explicit"
+}
+
+# scan argv for --lang TAG / --lang=TAG without consuming it (it is forwarded to disktui)
+scan_lang_arg() {
+  scan_prev=""
+  for scan_a in "$@"; do
+    case "$scan_prev" in
+      --lang) printf '%s' "$scan_a"; return 0 ;;
+    esac
+    case "$scan_a" in
+      --lang=*) printf '%s' "${scan_a#*=}"; return 0 ;;
+    esac
+    scan_prev=$scan_a
+  done
+  return 1
+}
+
+# t <en> <zh-Hans> <zh-Hant>
+t() {
+  case "$L10N" in
+    zh-hans) printf '%s' "$2" ;;
+    zh-hant) printf '%s' "$3" ;;
+    *)       printf '%s' "$1" ;;
+  esac
+}
+
+usage() {
+  case "$L10N" in
+    zh-hans)
+      cat <<'EOF'
+用法: diskinfer [问题]
+      diskinfer -m /path/to/model.gguf [--arena MiB] [问题] [引擎参数]
+      diskinfer --api-only -m /path/to/model.gguf [--n-ctx N]
+
+  启动后是 TUI：先进模型选择页；带 -m 则跳过选择。
+  设置页：上下文 3..n_ctx_train（默认 16）、温度（0.70）、
+          聊天模板、MoE 快速路径、/v1 API（端口 4000）。
+  按键：↑↓ 选择、←→ 调整、Enter 切换、s 开始、c 取消、q 退出。
+
+  --lang TAG    界面语言（启动器与 TUI，CLI 或 DISKINFER_LANG）：
+                auto / en / zh-Hans / zh-Hant（默认按系统）
+  --arena MiB   权重 arena 大小，128..2048，按可用内存收窄。
+                越大读盘越少；能装下整个模型时就和常驻内存一样快。
+  -n N          最多生成多少 token
+  -c N          上下文大小
+  -ub N         prefill 批大小
+  -t N          线程数
+  --temp F      采样温度
+  --raw --chat --sys "text"   提示词模式
+  --api-only    无 TUI，只开 /v1 API 服务
+
+模型搜索顺序:
+  /data/local/tmp/llm/models/*.gguf
+  ~/models/*.gguf
+  /storage/emulated/0/models/*.gguf
+EOF
+      ;;
+    zh-hant)
+      cat <<'EOF'
+用法: diskinfer [問題]
+      diskinfer -m /path/to/model.gguf [--arena MiB] [問題] [引擎參數]
+      diskinfer --api-only -m /path/to/model.gguf [--n-ctx N]
+
+  啟動後是 TUI：先進模型選擇頁；帶 -m 則跳過選擇。
+  設定頁：上下文 3..n_ctx_train（預設 16）、溫度（0.70）、
+          聊天模板、MoE 快速路徑、/v1 API（連接埠 4000）。
+  按鍵：↑↓ 選擇、←→ 調整、Enter 切換、s 開始、c 取消、q 離開。
+
+  --lang TAG    介面語言（啟動器與 TUI，CLI 或 DISKINFER_LANG）：
+                auto / en / zh-Hans / zh-Hant（預設依系統）
+  --arena MiB   權重 arena 大小，128..2048，依可用記憶體收窄。
+                越大讀盤越少；能裝下整個模型時就和常駐記憶體一樣快。
+  -n N          最多產生多少 token
+  -c N          上下文大小
+  -ub N         prefill 批大小
+  -t N          執行緒數
+  --temp F      取樣溫度
+  --raw --chat --sys "text"   提示詞模式
+  --api-only    無 TUI，只開 /v1 API 服務
+
+模型搜尋順序:
+  /data/local/tmp/llm/models/*.gguf
+  ~/models/*.gguf
+  /storage/emulated/0/models/*.gguf
+EOF
+      ;;
+    *)
+      cat <<'EOF'
+usage: diskinfer [question]
+       diskinfer -m /path/to/model.gguf [--arena MiB] [question] [engine args]
+       diskinfer --api-only -m /path/to/model.gguf [--n-ctx N]
+
+  the TUI starts with a model picker; with -m the picker is skipped.
+  settings page: context 3..n_ctx_train (default 16), temperature (0.70),
+                 chat template, MoE fast path, /v1 API on port 4000.
+  keys: ↑↓ select, ←→ adjust, Enter toggle, s start, c cancel, q quit.
+
+  --lang TAG     UI language for the launcher and the TUI (CLI or
+                 DISKINFER_LANG): auto / en / zh-Hans / zh-Hant (default: system)
+  --arena MiB    weight arena size, 128..2048, clamped to free RAM.
+                 bigger = fewer disk re-reads. if it can hold the whole model the
+                 run becomes as fast as a normal in-RAM inference.
+  -n N           max tokens to generate
+  -c N           context size
+  -ub N          prefill batch
+  -t N           threads
+  --temp F       sampling temperature
+  --raw --chat --sys "text"   prompt modes
+  --api-only     headless /v1 API server (no TUI)
+
+model search order:
+  /data/local/tmp/llm/models/*.gguf
+  ~/models/*.gguf
+  /storage/emulated/0/models/*.gguf
+EOF
+      ;;
+  esac
+}
+
+msg() {
+  case "$1" in
+    no_model_root)
+      case "$L10N" in
+        zh-hans)
+          printf 'diskinfer: 没有找到 .gguf 模型（找过 %s, ~/models, /storage/emulated/0/models）\n' "$2"
+          printf '  把模型推到：\n'
+          printf '    adb push model.gguf /data/local/tmp/llm/models/\n'
+          printf '    adb push model.gguf /storage/emulated/0/models/\n'
+          printf '  或者直接指定：diskinfer -m /path/to/model.gguf\n'
+          ;;
+        zh-hant)
+          printf 'diskinfer: 沒有找到 .gguf 模型（找過 %s, ~/models, /storage/emulated/0/models）\n' "$2"
+          printf '  把模型推到：\n'
+          printf '    adb push model.gguf /data/local/tmp/llm/models/\n'
+          printf '    adb push model.gguf /storage/emulated/0/models/\n'
+          printf '  或者直接指定：diskinfer -m /path/to/model.gguf\n'
+          ;;
+        *)
+          printf 'diskinfer: no .gguf model found (looked in %s, ~/models, /storage/emulated/0/models)\n' "$2"
+          printf '  push a model with:\n'
+          printf '    adb push model.gguf /data/local/tmp/llm/models/\n'
+          printf '    adb push model.gguf /storage/emulated/0/models/\n'
+          printf '  or: diskinfer -m /path/to/model.gguf\n'
+          ;;
+      esac
+      ;;
+    no_model_user)
+      case "$L10N" in
+        zh-hans)
+          printf 'diskinfer: 没有找到 .gguf 模型（找过 /data/local/tmp/llm/models, ~/models, /storage/emulated/0/models）\n'
+          printf '  非 root（Termux 用户）：最简单的做法是放进 Termux 私有目录（永远可读）\n'
+          printf '    cp /sdcard/Download/model.gguf ~/models/\n'
+          printf '  或者给 Termux 存储权限后用共享目录：\n'
+          printf '    adb shell appops set com.termux MANAGE_EXTERNAL_STORAGE allow\n'
+          printf '    adb shell pm grant com.termux android.permission.READ_EXTERNAL_STORAGE\n'
+          printf '    adb push model.gguf /storage/emulated/0/models/\n'
+          printf '  或者直接指定：diskinfer -m /path/to/model.gguf\n'
+          ;;
+        zh-hant)
+          printf 'diskinfer: 沒有找到 .gguf 模型（找過 /data/local/tmp/llm/models, ~/models, /storage/emulated/0/models）\n'
+          printf '  非 root（Termux 使用者）：最簡單的做法是放進 Termux 私有目錄（永遠可讀）\n'
+          printf '    cp /sdcard/Download/model.gguf ~/models/\n'
+          printf '  或者給 Termux 儲存權限後用共享目錄：\n'
+          printf '    adb shell appops set com.termux MANAGE_EXTERNAL_STORAGE allow\n'
+          printf '    adb shell pm grant com.termux android.permission.READ_EXTERNAL_STORAGE\n'
+          printf '    adb push model.gguf /storage/emulated/0/models/\n'
+          printf '  或者直接指定：diskinfer -m /path/to/model.gguf\n'
+          ;;
+        *)
+          printf 'diskinfer: no .gguf model found (looked in /data/local/tmp/llm/models, ~/models, /storage/emulated/0/models)\n'
+          printf '  non-root (Termux user): the simplest place is the Termux private dir (always readable)\n'
+          printf '    cp /sdcard/Download/model.gguf ~/models/\n'
+          printf '  or grant Termux storage permission and use the shared dir:\n'
+          printf '    adb shell appops set com.termux MANAGE_EXTERNAL_STORAGE allow\n'
+          printf '    adb shell pm grant com.termux android.permission.READ_EXTERNAL_STORAGE\n'
+          printf '    adb push model.gguf /storage/emulated/0/models/\n'
+          printf '  or: diskinfer -m /path/to/model.gguf\n'
+          ;;
+      esac
+      ;;
+    no_disktui)  printf "$(t 'diskinfer: disktui not installed in %s (run the installer / setup.sh first)\n' 'diskinfer: %s 里没有安装 disktui（先运行安装器 / setup.sh）\n' 'diskinfer: %s 裡沒有安裝 disktui（先執行安裝器 / setup.sh）\n')" "$2" ;;
+    no_root_note) printf "$(t 'diskinfer: no root, running as the termux user\n' 'diskinfer: 没有 root，以 Termux 用户运行\n' 'diskinfer: 沒有 root，以 Termux 使用者執行\n')" ;;
+  esac
+}
+
+LANG_FROM_CLI=$(scan_lang_arg "$@" || true)
+L10N=$(detect_lang "$LANG_FROM_CLI")
+# hand the resolved language to run_as_root.sh / disktui (CLI --lang still wins there)
+export DISKINFER_LANG=$L10N
+
 H=/data/data/com.termux/files/home
 L=$H/llm
 RUN=/data/local/tmp/llm/run_as_root.sh
+TMP=/data/local/tmp/llm
 M=""
 ARGS=()
-HAS_ARENA=0
+
+# model search order (contract v2 §3): root tmp, termux private, shared storage
+MODEL_DIRS=("$TMP/models" "$H/models" "/storage/emulated/0/models")
+
+list_models() {
+  for d in "${MODEL_DIRS[@]}"; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*.gguf; do
+      [ -f "$f" ] && ls -la "$f"
+    done
+  done
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -m) M="$2"; shift 2 ;;
-    -h|--help)
-      cat <<'USAGE'
-usage: diskinfer [question]
-       diskinfer -m /path/to/model.gguf [--arena MiB] [question] [engine args]
-
-  --arena MiB    weight arena size, 128..2048, clamped to free RAM.
-                 default = MemTotal/8 (at least 176).
-                 bigger = fewer disk re-reads. if it can hold the whole model the
-                 run becomes as fast as a normal in-RAM inference.
-  -n N           max tokens to generate (default 256, capped by ctx)
-  -c N           context size (default 256)
-  -ub N          prefill batch (default 4; 1 = least RAM, slowest prefill)
-  -t N           threads (default 4, try 8 on a phone)
-  --temp F       sampling temperature (default 1.0)
-  --top-k N      default 20
-  --top-p F      default 0.95
-  --raw          raw completion prompt (default)
-  --chat         use the chat template with thinking off
-  --sys "text"   system message for --chat
-
-model search order:
-  /storage/emulated/0/models/*.gguf
-  $HOME/models/*.gguf
-  /data/local/tmp/llm/*.gguf
-USAGE
-      exit 0 ;;
-    -l|--list)
-      ls -la /storage/emulated/0/models/*.gguf 2>/dev/null
-      ls -la "$H"/models/*.gguf 2>/dev/null
-      exit 0 ;;
-    --arena) HAS_ARENA=1; ARGS+=("$1" "$2"); shift 2 ;;
-    --arena=*) HAS_ARENA=1; ARGS+=("$1"); shift ;;
+    -h|--help) usage; exit 0 ;;
+    -l|--list) list_models; exit 0 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 
+# only hand disktui the directories that actually exist; ':' separated
+DIRS=""
+for d in "${MODEL_DIRS[@]}"; do
+  [ -d "$d" ] || continue
+  if [ -z "$DIRS" ]; then DIRS=$d; else DIRS=$DIRS:$d; fi
+done
+[ -n "$DIRS" ] && export DISKINFER_MODEL_DIRS=$DIRS
+
 if [ -z "$M" ]; then
-  for d in /storage/emulated/0/models "$H/models" /data/local/tmp/llm; do
+  N=0
+  FIRST=""
+  for d in "${MODEL_DIRS[@]}"; do
     [ -d "$d" ] || continue
     for f in "$d"/*.gguf; do
-      [ -f "$f" ] && M="$f" && break
+      [ -f "$f" ] || continue
+      N=$((N + 1))
+      [ -z "$FIRST" ] && FIRST=$f
     done
-    [ -n "$M" ] && break
   done
-fi
-
-if [ -z "$M" ] || [ ! -f "$M" ]; then
-  echo "no .gguf model found (looked in /storage/emulated/0/models, ~/models, /data/local/tmp/llm)"
-  exit 1
-fi
-
-# default arena: an eighth of the installed RAM, at least 176 MiB (one whole tensor)
-if [ "$HAS_ARENA" = "0" ]; then
-  tot_kb=""
-  while read -r key val _; do
-    if [ "${key%:}" = "MemTotal" ]; then tot_kb="$val"; break; fi
-  done < /proc/meminfo
-  if [ -n "$tot_kb" ]; then
-    a=$(( tot_kb / 1024 / 8 ))
-    [ "$a" -lt 176 ] && a=176
-    [ "$a" -gt 2048 ] && a=2048
-    ARGS=("--arena" "$a" "${ARGS[@]}")
+  if [ "$N" -eq 1 ]; then
+    M=$FIRST
+  elif [ "$N" -gt 1 ]; then
+    # more than one model: let the TUI show its picker instead of silently taking the first
+    export DISKINFER_NO_AUTOMODEL=1
   fi
 fi
 
-# root gives us oom protection and a stable cpu governor; fall back to plain user if not
-if [ -x "$RUN" ] && su -c true >/dev/null 2>&1; then
-  QUOTED=$(printf '%q ' "${ARGS[@]}" 2>/dev/null)
-  exec su -c "\"$RUN\" \"$M\" $QUOTED"
+if [ -z "$M" ] && [ "${DISKINFER_NO_AUTOMODEL:-0}" != "1" ]; then
+  if [ "$(id -u)" = "0" ]; then
+    msg no_model_root "$TMP/models"
+  else
+    msg no_model_user
+  fi
+  exit 1
 fi
 
-echo "diskinfer: no root, running as the termux user"
+BIN=$L/disktui
+if [ ! -x "$BIN" ]; then
+  if [ -x "$TMP/disktui" ]; then
+    BIN=$TMP/disktui
+  else
+    msg no_disktui "$L"
+    exit 1
+  fi
+fi
+
+# rooted phones: run the engine as root (oom protection, arena clamp, governor).
+# everything else has to work as the plain termux user, so quote for sh -c and go.
+if [ -x "$RUN" ] && su -c true >/dev/null 2>&1; then
+  quote() { printf "%s" "$1" | sed "s/'/'\\\\''/g"; }
+  CMD="DISKINFER_LANG='$L10N' "
+  [ -n "$DIRS" ] && CMD="${CMD}DISKINFER_MODEL_DIRS='$(quote "$DIRS")' "
+  [ "${DISKINFER_NO_AUTOMODEL:-0}" = "1" ] && CMD="${CMD}DISKINFER_NO_AUTOMODEL=1 "
+  if [ -n "$M" ]; then
+    CMD="$CMD'$RUN' -m '$(quote "$M")'"
+  else
+    CMD="$CMD'$RUN'"
+  fi
+  for a in "${ARGS[@]}"; do
+    CMD="$CMD '$(quote "$a")'"
+  done
+  exec su -c "$CMD"
+fi
+
+msg no_root_note
 export LLAMA_DISK_LOG=$H/diskinfer.log
-exec "$L/disktui" -m "$M" "${ARGS[@]}"
+if [ -n "$M" ]; then
+  exec "$BIN" -m "$M" "${ARGS[@]}"
+else
+  exec "$BIN" "${ARGS[@]}"
+fi

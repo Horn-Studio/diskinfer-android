@@ -1,8 +1,30 @@
-﻿baseline : ggml-org/llama.cpp master, downloaded 2026-10-24
-           (zip snapshot, roughly commit 8e5a58df87ab59dfceb5b961ae26691e39f30c24)
-toolchain: Android NDK r27c, static, -DBUILD_SHARED_LIBS=OFF -static
-           armv7 needs -mfpu=neon-vfpv4 -mfloat-abi=softfp and -D_FILE_OFFSET_BITS=64
-mtune    : arm64: default (-O3); armv7: -march=armv7-a -mfpu=neon-vfpv4
-
-llama.cpp 的接口变动很快，patch 用 git apply -3 / patch -p1 --fuzz=3 可能有偏移，
-对不上就看 src/PATCHES.md 手工改（一共 6 个文件、~230 行）。
+baseline  : ggml-org/llama.cpp @ cd959bae99ff4bed22bef2604f45241c09bbb8c8
+            tag v0.9.0，2026-11-04，nightly b12110，ggml 0.29.0
+            zip snapshot（F:\work\upstream\llama-v0.9.0.zip）；fork 版本号 0.9.0-dev
+previous  : ggml-org/llama.cpp @ 8e5a58df87ab59dfceb5b961ae26691e39f30c24
+            0.7.0-dev，2026-10-24，ggml 0.27.0（本轮为替换性升级，整树换成 v0.9.0）
+delta     : v0.9.0 自身相对旧基线为 531 changed + 157 added + 4 removed（上游的算子/模型/工具
+            变化，含 F8_E4M3 等新类型）。因此同一模型在新旧二进制上的 greedy token 序列可能
+            不同，这属于上游变化；验证口径应为「同一 v0.9.0 构建内」对比
+            （native vs stream / LLAMA_DISK_MOE=0 vs 1）。
+latest    : master a4d4f2fd4ec85ec6a0a9ece4870416c1b6cc24f5（2026-11-09T13:48:32Z，nightly b12228）
+            v0.9.0 cd959bae99ff4bed22bef2604f45241c09bbb8c8（2026-11-04，nightly b12110）
+            ^^ 本 fork 基线；master 上 v0.9.0 之后还有 4 天提交，暂不跟进
+toolchain : Android NDK r27c, static, -DBUILD_SHARED_LIBS=OFF -static
+            armv7 needs -mfpu=neon-vfpv4 -mfloat-abi=softfp and -D_FILE_OFFSET_BITS=64
+mtune     : arm64: default (-O3); armv7: -march=armv7-a -mfpu=neon-vfpv4
+patch     : patch/disk-stream-v090.patch（本机同步产物：F:\work\v090\patch\disk-stream-v090.patch）
+            20 文件 / 279,660 B / 7724 insertions(+), 3 deletions(-)
+            SHA256 355E167A69EF49F1D65B3D77FF34D5854EAFC3840C1252B25964C36C86E102C5
+            相对 upstream v0.9.0；重放方法见 src/PATCHES.md
+verified  : 补丁已重放验证（2026-11-10）：干净 v0.9.0 树 + `git apply --check` / `git apply` 通过，
+            应用后与 canonical 源码树 4068/4068 个文件 MD5 全同（0 差异）。
+not merged: e95426f1（2026-11-07，MoE cache on CPU）：把 MoE 图改成两个 MUL_MAT_ID + add，
+            ids 可能含 -1；需要 fork 的 MoE 快路径单独适配与验证，本轮未跟进。
+            12ab5979（2026-11-08，CPU 后端改 F32 src1）：ggml_graph_plan 的 src1 计算缓冲翻倍，
+            小内存设备要实测；且会改变逐 token 结果，需要单独 A/B 评估。两者均在 v0.9.0 之后。
+known issue: LLAMA_DISK_WINDOW=1 是既有实验路径（在未改引擎的原版二进制上已确认存在数值差异），
+            本轮未修；建议不启用，且不要与 MoE 组合。
+detail    : src/PATCHES.md（20 文件清单、v0.9.0 适配点、重放步骤）
+            src/UPSTREAM-TRACKING.md 是 0.7.0-dev 时代的历史跟踪分析（仅 Android 仓库保留）。
+本文件在三个仓库（diskinfer / diskinfer-linux / diskinfer-windows）内容一致。
