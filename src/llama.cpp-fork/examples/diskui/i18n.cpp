@@ -1,4 +1,4 @@
-﻿// i18n.cpp: table driven en / zh-Hans / zh-Hant strings + platform language detection
+// i18n.cpp: table driven en / zh-Hans / zh-Hant strings + platform language detection
 //
 // the tables are plain const char* rows (key, en, zh-Hans, zh-Hant) grouped by
 // area. tr() is a linear scan: a few hundred short keys, called a few hundred
@@ -113,6 +113,7 @@ static const Entry kUiEntries[] = {
     { "set.moe_path",       "MoE fast path", u8"MoE 快速路径", u8"MoE 快速路徑" },
     { "set.arena",          "Arena (MB)", u8"内存池 (MB)", u8"記憶體池 (MB)" },
     { "set.api_server",     "API server", u8"API 服务", u8"API 服務" },
+    { "set.prefill",        "Prefill batch", u8"Prefill 批量", u8"Prefill 批次" },
     { "set.ctx_hint_fmt",   "3 .. %d   <- -> adjust, or type a number",
                             u8"3 .. %d   ←→ 调整，或直接输入数字",
                             u8"3 .. %d   ←→ 調整，或直接輸入數字" },
@@ -128,9 +129,27 @@ static const Entry kUiEntries[] = {
     { "set.moe_hint",       "only router selected experts are read (reloads the model)",
                             u8"只读取路由选中的专家（会重新加载模型）",
                             u8"只讀取路由選中的專家（會重新載入模型）" },
-    { "set.arena_hint",     "128..2048 MB   0 = auto (reloads model)",
-                            u8"128..2048 MB，0=自动（重载模型）",
-                            u8"128..2048 MB，0=自動（重載模型）" },
+    { "set.arena_hint",     "8..2048 MB   0 = auto; below the largest tensor reads chunks (reload)",
+                            u8"8..2048 MB，0=自动；小于最大张量时自动分块读（重载模型）",
+                            u8"8..2048 MB，0=自動；小於最大張量時自動分塊讀（重載模型）" },
+    { "set.prefill_hint",   "1..256 tok per prefill batch; bigger = fewer graph launches, more peak RAM",
+                            u8"1..256 token/批；越大 prefill 越快、峰值内存越高",
+                            u8"1..256 token/批；越大 prefill 越快、峰值記憶體越高" },
+    { "set.ram_resident_fmt", "  RAM resident ~ %s   (kv %s + rec %s + arena %s)",
+                               u8"  常驻 RAM ≈ %s（KV %s + 递归 %s + arena %s）",
+                               u8"  常駐 RAM ≈ %s（KV %s + 遞迴 %s + arena %s）" },
+    { "set.ram_peak_fmt",   "  RAM peak     ~ %s   (compute %s + batch/logits %s)",
+                            u8"  峰值 RAM ≈ %s（计算缓冲 %s + 批/输出 %s）",
+                            u8"  峰值 RAM ≈ %s（計算緩衝 %s + 批/輸出 %s）" },
+    { "set.ram_note",       "  RAM estimate not available yet (model not loaded / busy)",
+                            u8"  RAM 预估暂不可用（模型未加载/推理中）",
+                            u8"  RAM 預估暫不可用（模型未載入/推理中）" },
+    { "run.info_arena_tiny_fmt", "arena %s (chunked, %s rows, direct io %s)",
+                                 u8"内存池 %s（分块，%s 行/块，direct io %s）",
+                                 u8"記憶體池 %s（分塊，%s 行/塊，direct io %s）" },
+    { "run.info_ram_fmt",       "  RAM est.  ~ %s resident / %s peak  (KV+rec %s)",
+                                 u8"  RAM 预估 ≈ %s 常驻 / %s 峰值（KV+递归 %s）",
+                                 u8"  RAM 預估 ≈ %s 常駐 / %s 峰值（KV+遞迴 %s）" },
     { "set.api_hint_fmt",   "http://127.0.0.1:%d/v1  (no key)",
                             u8"http://127.0.0.1:%d/v1  （无密钥）",
                             u8"http://127.0.0.1:%d/v1  （無金鑰）" },
@@ -448,6 +467,12 @@ static const Entry kUiEntries[] = {
 // ------------------------------------------------------------ engine strings
 static const Entry kEngineEntries[] = {
     { "eng.load_path_fmt",    "[load] %s", u8"[load] 加载 %s", u8"[load] 載入 %s" },
+    { "eng.cache_on_fmt",     "[load] read cache on: model %s fits into %s available RAM (buffered io, less flash wear)",
+                              u8"[load] 读盘缓存开启：模型 %s 可放入可用内存 %s（buffered，读盘更少更省寿命）",
+                              u8"[load] 讀盤快取開啟：模型 %s 可放入可用記憶體 %s（buffered，讀盤更少更省壽命）" },
+    { "eng.cache_off_fmt",    "[load] read cache off: model %s > %s available RAM (direct io, no page cache pressure)",
+                              u8"[load] 读盘缓存关闭：模型 %s > 可用内存 %s（direct io，避免 page cache 挤占内存）",
+                              u8"[load] 讀盤快取關閉：模型 %s > 可用記憶體 %s（direct io，避免 page cache 擠佔記憶體）" },
     { "eng.moe_on",           "[load] moe fast path on (LLAMA_DISK_MOE=1)",
                               u8"[load] MoE 快速路径：开（LLAMA_DISK_MOE=1）",
                               u8"[load] MoE 快速路徑：開（LLAMA_DISK_MOE=1）" },

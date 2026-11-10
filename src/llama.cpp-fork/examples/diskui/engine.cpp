@@ -28,7 +28,72 @@
 #include <stdexcept>
 #include <thread>
 
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
+
 namespace diskui {
+
+namespace {
+
+// resident set size of this process right now (0 when the platform has no /proc)
+unsigned long long rss_bytes() {
+#if defined(_WIN32)
+    return 0;
+#else
+    FILE * f = fopen("/proc/self/status", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    char line[256];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (strncmp(line, "VmRSS:", 6) == 0) {
+            kb = strtoull(line + 6, nullptr, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb * 1024ull;
+#endif
+}
+
+// MemAvailable in bytes (0 when unknown)
+unsigned long long mem_available_bytes() {
+#if defined(_WIN32)
+    return 0;
+#else
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    char line[256];
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (strncmp(line, "MemAvailable:", 13) == 0) {
+            kb = strtoull(line + 13, nullptr, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return kb * 1024ull;
+#endif
+}
+
+unsigned long long file_bytes(const std::string & path) {
+#if defined(_WIN32)
+    (void) path;
+    return 0;
+#else
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || st.st_size < 0) {
+        return 0;
+    }
+    return (unsigned long long) st.st_size;
+#endif
+}
+
+} // namespace
 
 // ------------------------------------------------------------------ small utils
 
@@ -270,6 +335,9 @@ bool engine::cancel_requested() const {
 bool engine::load(const std::string & path, bool moe, std::string & err, int arena_mb) {
     unload();
 
+    const bool odirect_user = getenv("LLAMA_DISK_ODIRECT") != nullptr;
+    const unsigned long long rss_before = rss_bytes();
+
     // defaults for the disk streaming layer, the caller can override any of them
     set_env_default("LLAMA_DISK_ODIRECT",   "1");
     set_env_default("LLAMA_DISK_MLOCK",     "1");
@@ -310,6 +378,19 @@ bool engine::load(const std::string & path, bool moe, std::string & err, int are
         return false;
     }
 
+    // read path: buffered reads let the page cache absorb the repeated full-model scans
+    // (once the model is warm nothing touches the flash any more, which is both much
+    // faster and much easier on the storage); direct io avoids filling the RAM when the
+    // model does not fit anyway. LLAMA_DISK_ODIRECT=0/1 in the environment overrides this.
+    if (!odirect_user) {
+        const unsigned long long avail = mem_available_bytes();
+        const unsigned long long fsize = file_bytes(path);
+        const bool cache = fsize > 0 && avail > 0 && fsize <= avail * 45 / 100;
+        set_env("LLAMA_DISK_ODIRECT", cache ? "0" : "1");
+        log(cache ? i18n::trf("eng.cache_on_fmt", human_bytes(fsize).c_str(), human_bytes(avail).c_str())
+                  : i18n::trf("eng.cache_off_fmt", human_bytes(fsize).c_str(), human_bytes(avail).c_str()));
+    }
+
     const int64_t t0 = now_us();
     log(i18n::trf("eng.load_path_fmt", path.c_str()));
     log(i18n::tr(moe ? "eng.moe_on" : "eng.moe_off"));
@@ -340,6 +421,12 @@ bool engine::load(const std::string & path, bool moe, std::string & err, int are
         m_n_ctx_train = (int) llama_model_n_ctx_train(model);
         m_n_layer     = (int) llama_model_n_layer(model);
         m_moe_loaded  = moe;
+        m_base_rss    = rss_bytes();
+        m_model_ram   = m_base_rss > rss_before ? m_base_rss - rss_before : 0;
+        m_mem_cache   = mem_estimate();
+        m_mem_cache_ctx = -1;
+        m_mem_cache_ub  = -1;
+        m_mem_cache_model = nullptr;
     }
 
     llama_disk::llama_disk_stats s;
@@ -411,6 +498,126 @@ int engine::n_layer() const {
 
 int engine::requested_arena_mb() const {
     return m_arena_mb;
+}
+
+unsigned long long engine::model_ram() const {
+    return m_model_ram;
+}
+
+void engine::set_llama_logger(llama_logger_t cb, void * ud) {
+    m_llama_logger    = cb;
+    m_llama_logger_ud = ud;
+    llama_log_set(cb, ud);
+}
+
+// the size lines llama.cpp prints while a context is created are the exact numbers for
+// KV cache / recurrent state / graph compute buffer; parse them out of a throw-away
+// context and cache the result per (model, n_ctx, n_ubatch)
+mem_estimate engine::probe_memory(int n_ctx, int n_ubatch) {
+    mem_estimate e;
+
+    llama_model * model = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(m_model_mtx);
+        model = m_model;
+        if (m_mem_cache.ok && m_mem_cache_model == model &&
+                m_mem_cache_ctx == n_ctx && m_mem_cache_ub == n_ubatch) {
+            return m_mem_cache;
+        }
+    }
+    if (model == nullptr) {
+        e.err = "no model loaded";
+        return e;
+    }
+
+    n_ctx    = std::max(n_ctx, 4);
+    n_ubatch = std::max(n_ubatch, 1);
+
+    std::vector<std::string> lines;
+    static auto capture_cb = [](enum ggml_log_level, const char * text, void * ud) {
+        if (text != nullptr) {
+            static_cast<std::vector<std::string> *>(ud)->push_back(text);
+        }
+    };
+    llama_log_set(capture_cb, &lines);
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx    = (uint32_t) n_ctx;
+    cp.n_batch  = (uint32_t) n_ubatch;
+    cp.n_ubatch = (uint32_t) n_ubatch;
+    cp.n_threads = 4;
+    cp.no_perf   = true;
+    llama_context * ctx = llama_init_from_model(model, cp);
+
+    llama_log_set(m_llama_logger, m_llama_logger_ud);
+
+    if (ctx == nullptr) {
+        e.err = "context creation failed";
+        return e;
+    }
+    llama_free(ctx);
+
+    auto parse_size = [&lines](const char * needle) -> unsigned long long {
+        for (const auto & l : lines) {
+            const char * p = strstr(l.c_str(), needle);
+            if (p == nullptr) {
+                continue;
+            }
+            p = strchr(p, '=');
+            if (p == nullptr) {
+                continue;
+            }
+            const double mib = atof(p + 1);
+            if (mib > 0.0) {
+                return (unsigned long long) (mib * 1024.0 * 1024.0);
+            }
+        }
+        return 0;
+    };
+
+    e.kv        = parse_size("llama_kv_cache: size =");
+    e.recurrent = parse_size("llama_memory_recurrent: size =");
+    e.compute   = parse_size("CPU compute buffer size =");
+    if (e.compute == 0) {
+        e.compute = parse_size("CPU compute buffer size is");
+    }
+
+    llama_disk::llama_disk_stats ds;
+    llama_disk::get_stats(&ds);
+
+    {
+        std::lock_guard<std::mutex> lk(m_model_mtx);
+        e.model  = m_model_ram;
+        e.arena  = ds.arena_bytes;
+        e.base_rss = m_base_rss > 0 ? m_base_rss : rss_bytes();
+    }
+
+    const int n_vocab = m_vocab != nullptr ? (int) llama_vocab_n_tokens(m_vocab) : 0;
+    const int n_embd  = (int) llama_model_n_embd(model);
+
+    // prefill batches hold the token ids / embeddings and one logits row per output token
+    e.scratch = (unsigned long long) n_ubatch * (unsigned long long) n_embd * 4ull
+              + (unsigned long long) n_vocab * 4ull
+              + (2ull << 20);
+
+    // the arena is allocated but only touched as the weights are streamed: at most the
+    // whole arena (or the whole model, whichever is smaller) becomes resident
+    const unsigned long long arena_used = ds.registered_bytes > 0
+        ? std::min<unsigned long long>(ds.arena_bytes, ds.registered_bytes)
+        : ds.arena_bytes;
+    e.resident = e.base_rss + e.kv + e.recurrent + arena_used;
+    e.peak     = e.resident + e.compute + e.scratch;
+
+    e.ok = true;
+
+    {
+        std::lock_guard<std::mutex> lk(m_model_mtx);
+        m_mem_cache       = e;
+        m_mem_cache_ctx   = n_ctx;
+        m_mem_cache_ub    = n_ubatch;
+        m_mem_cache_model = model;
+    }
+    return e;
 }
 
 bool engine::has_chat_template() const {

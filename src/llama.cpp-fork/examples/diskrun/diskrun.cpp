@@ -9,10 +9,13 @@
 #endif
 #endif
 
+#include <algorithm>
+
 #include "llama.h"
 #include "ggml-cpu.h"
 
 #include <clocale>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -197,15 +200,66 @@ int main(int argc, char ** argv) {
         return llama_decode(ctx, batch) == 0;
     };
 
+    // debugging: fingerprint the logits after every decode to compare window modes
+    const bool logit_hash = getenv("LLAMA_DISK_LOGIT_HASH") != nullptr &&
+                            atoi(getenv("LLAMA_DISK_LOGIT_HASH")) == 1;
+    auto hash_logits = [&](const char * tag, int step) {
+        if (!logit_hash) {
+            return;
+        }
+        const float * lg = llama_get_logits_ith(ctx, -1);
+        if (lg == nullptr) {
+            fprintf(stderr, "dbg: logits %s step=%d null\n", tag, step);
+            return;
+        }
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+        uint64_t h = 1469598103934665603ull;
+        double   sum = 0.0;
+        int      top = 0;
+        float    topv = -INFINITY;
+        for (int i = 0; i < n_vocab; ++i) {
+            const uint32_t bits = (uint32_t) (int32_t) llroundf(lg[i] * 1000.0f);
+            h = (h ^ bits) * 1099511628211ull;
+            sum += lg[i];
+            if (lg[i] > topv) {
+                topv = lg[i];
+                top  = i;
+            }
+        }
+        fprintf(stderr, "dbg: logits %s step=%d n=%d h=%016llx sum=%.6f top=%d topv=%.6f\n",
+                tag, step, n_vocab, (unsigned long long) h, sum, top, topv);
+    };
+
     int n_pos = 0;
     const int64_t t_prefill = ggml_time_us();
-    for (int i = 0; i < n_prompt; ++i) {
-        if (!decode_one(tokens[i], n_pos++, i == n_prompt - 1)) {
-            fprintf(stderr, "diskrun: prefill failed at %d\n", i);
-            return 1;
+    const char * env_pb = getenv("LLAMA_PREFILL_BATCH");
+    const int prefill_batch = env_pb != nullptr ? std::max(1, atoi(env_pb)) : 1;
+    for (int i = 0; i < n_prompt; ) {
+        const int m = std::min(prefill_batch, n_prompt - i);
+        if (m == 1) {
+            if (!decode_one(tokens[i], n_pos++, i == n_prompt - 1)) {
+                fprintf(stderr, "diskrun: prefill failed at %d\n", i);
+                return 1;
+            }
+        } else {
+            batch.n_tokens = m;
+            for (int j = 0; j < m; ++j) {
+                const int k = i + j;
+                batch.token[j]     = tokens[k];
+                batch.pos[j]       = n_pos++;
+                batch.n_seq_id[j]  = 1;
+                batch.seq_id[j][0] = 0;
+                batch.logits[j]    = (k == n_prompt - 1);
+            }
+            if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "diskrun: prefill batch failed at %d\n", i);
+                return 1;
+            }
         }
-        fprintf(stderr, "diskrun: prefill token %d/%d done, rss = %ld MiB\n", i + 1, n_prompt, rss_kb() / 1024);
+        i += m;
+        fprintf(stderr, "diskrun: prefill token %d/%d done, rss = %ld MiB\n", i, n_prompt, rss_kb() / 1024);
     }
+    hash_logits("prefill", n_prompt - 1);
     fprintf(stderr, "diskrun: prefill took %.1f s\n", (ggml_time_us() - t_prefill) / 1e6);
     print_rss("after prefill");
 
@@ -238,6 +292,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        hash_logits("gen", n_gen);
         fprintf(stderr, "\ndiskrun: token %d id=%d sample=%.3f s, rss = %ld MiB\n",
                 n_gen, cur, (ggml_time_us() - t0) / 1e6, rss_kb() / 1024);
     }

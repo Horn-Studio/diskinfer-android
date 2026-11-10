@@ -26,6 +26,22 @@ LLAMA_API bool moe_enabled();
 // number of output rows to multiply at a time, 0 disables the chunked output layer
 LLAMA_API int out_chunk_rows();
 
+// tiny arena mode: the arena is smaller than the largest weight tensor, so big tensors are read
+// in row/view chunks and nothing has to be resident as a whole. auto-enabled when the requested
+// arena is smaller than the largest registered tensor (LLAMA_DISK_TINY_ARENA=0 disables)
+LLAMA_API bool tiny_arena_mode();
+
+// split every big matmul into row chunks (auto in tiny arena mode, LLAMA_DISK_SPLIT_MM overrides)
+LLAMA_API bool split_all_matmul();
+
+// row chunk for one matmul weight: the configured LLAMA_DISK_OUT_CHUNK, or a chunk of roughly
+// a quarter of a tiny arena. 0 means "do not chunk". At most 64 chunks per tensor, so the graph
+// stays within the tensor-object budget of llama.cpp.
+LLAMA_API int matmul_chunk_rows(int64_t ne1, size_t row_bytes);
+
+// a tensor this big does not fit comfortably into the arena, split its matmul (tiny arena only)
+LLAMA_API int64_t split_threshold_bytes();
+
 // allocate the arena and install the ggml hooks
 LLAMA_API void init();
 
@@ -51,6 +67,8 @@ struct llama_disk_stats {
     int                direct_io;        // 1 when unbuffered reads are in use
     int                mlock;            // 1 when the arena is locked in RAM
     int                prefetch;         // 1 when the prefetch reader is running
+    int                tiny;             // 1 when the tiny-arena mode is active (chunked reads)
+    int                chunk_rows;       // row chunks used for big matmuls in tiny-arena mode
     // MoE fast path: only the experts selected by the router are streamed in
     int                moe;              // 1 = the MoE fast path is enabled for this run
     unsigned long long moe_nodes;        // MUL_MAT_ID nodes served from an expert window

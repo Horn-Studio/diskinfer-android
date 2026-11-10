@@ -1665,10 +1665,21 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w_s) const {
     // disk streaming: the output layer is far too big to keep resident, multiply it in row chunks
     // so only one chunk has to be read from disk at a time
-    const int chunk_rows = llama_disk::out_chunk_rows();
+    const int chunk_rows = llama_disk::matmul_chunk_rows(w->ne[1], w->nb[1]);
+    // the LM head is either a separate output.weight or, for tied embeddings, token_embd.weight
+    const char * wname = ggml_get_name(w);
+    const bool out_like = wname != nullptr && (strcmp(wname, "output.weight") == 0 ||
+                                               strcmp(wname, "token_embd.weight") == 0);
+    // LLAMA_DISK_SPLIT_MM=1: also split the other big matmuls (ffn/attn) into row chunks, so a
+    // tiny arena can hold any single chunk instead of the largest tensor of the model
+    const bool split_all = llama_disk::split_all_matmul();
+    const bool big_enough = split_all
+        ? ggml_nbytes(w) > (size_t) llama_disk::split_threshold_bytes() &&
+          ggml_nbytes(w) > (size_t) chunk_rows * w->nb[1]
+        : ggml_nbytes(w) >= (size_t) 64 << 20;
     if (chunk_rows > 0 && w_s == nullptr && loras->empty() && ggml_is_contiguous(w) &&
-            ggml_nbytes(w) >= (size_t) 64 << 20 && w->ne[1] > chunk_rows && cur->ne[1] <= 8 &&
-            strcmp(ggml_get_name(w), "output.weight") == 0) {
+            big_enough && w->ne[1] > chunk_rows && cur->ne[1] <= 512 &&
+            (out_like || split_all)) {
         const int64_t n_in  = w->ne[0];
         const int64_t n_out = w->ne[1];
 

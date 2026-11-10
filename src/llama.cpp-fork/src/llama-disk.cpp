@@ -241,6 +241,9 @@ struct state {
     bool     odirect  = false;
     bool     prefetch = true;
     bool     window = false;   // experimental: row/view windows
+    bool     window_rows  = true;  // GET_ROWS row windows
+    bool     window_dbg   = false; // LLAMA_DISK_WINDOW_DEBUG=1
+    bool     window_views = true;  // view windows
     bool     verbose = false;  // periodic counter dumps
     bool     moe     = false;  // experimental: only the selected experts are streamed
     size_t   align_io = ALIGN;
@@ -256,6 +259,13 @@ struct state {
     std::vector<arena_slot> slots;
     std::unordered_map<ggml_tensor *, disk_tensor> tensors;
     std::unordered_map<ggml_tensor *, int64_t> windows; // transient residency of a view of a disk tensor
+    std::unordered_map<ggml_tensor *, uint8_t *> window_saved; // data pointer the window overwrote
+    // windows whose pins dropped to zero: freed at the start of the next node, after every
+    // compute thread has passed the node barrier (some ops are executed by thread 0 only, so
+    // the last unpin can happen while the other threads are still waiting for the window)
+    std::vector<ggml_tensor *> windows_defer;
+    struct window_restore { ggml_tensor * ids = nullptr; std::vector<int32_t> orig; };
+    std::unordered_map<ggml_tensor *, window_restore> window_restore_map; // compact rows: ids to put back
     std::unordered_map<ggml_tensor *, moe_window> moe_windows; // compact expert blocks, one per weight tensor
     std::vector<ggml_tensor *> order; // tensors sorted by file offset, drives the prefetch
 
@@ -295,6 +305,9 @@ struct state {
     uint64_t n_moe_fallback = 0; // nodes that had to use the whole-tensor load
 
     size_t max_tensor = 0;
+    size_t max_row_bytes = 0;   // widest row among the registered tensors (chunk sizing)
+    int    auto_chunk_rows = 0; // row chunk picked to fit ~1/5 of a tiny arena
+    bool   tiny = false;        // arena smaller than the largest tensor: read big tensors in chunks
     int    cur_layer = -1;
     int    n_layer   = -1;
     std::string name_max;
@@ -318,6 +331,11 @@ thread_local bool tls_slot_set = false;
 // about to run (the node callbacks are strictly nested per thread: false ... true)
 thread_local ggml_tensor * tls_moe_w    = nullptr;
 thread_local bool          tls_moe_used = false;
+
+// GET_ROWS rows window: the tensor this compute thread pinned through ensure_rows_window()
+// (that window is pinned exactly once here, so the generic src loop must not pin it again)
+thread_local ggml_tensor * tls_rows_w   = nullptr;
+thread_local ggml_tensor * tls_cur_node = nullptr; // node being prepared by this thread
 thread_local std::vector<int32_t> tls_moe_ids;   // ids as read from the router
 thread_local std::vector<int32_t> tls_moe_sel;   // deduplicated expert ids
 thread_local std::vector<int32_t> tls_moe_remap; // original id -> compact slot
@@ -603,8 +621,10 @@ bool load_into(std::unique_lock<std::mutex> & lk, ggml_tensor * t, disk_tensor &
 
     if (g.need > S.arena_size) {
         dmsg("llama-disk: tensor '%s' needs %zu MiB but the arena is only %zu MiB, "
-                        "restart with a bigger LLAMA_DISK_STREAM_MB\n",
-                ggml_get_name(t), g.need >> 20, S.arena_size >> 20);
+                        "restart with a bigger LLAMA_DISK_STREAM_MB (node %s op %s)\n",
+                ggml_get_name(t), g.need >> 20, S.arena_size >> 20,
+                tls_cur_node ? ggml_get_name(tls_cur_node) : "?",
+                tls_cur_node ? ggml_op_name(tls_cur_node->op) : "?");
         S.fail    = true;
         dt.state  = ST_ABSENT;
         S.cv_done.notify_all();
@@ -754,6 +774,10 @@ void ensure_locked(std::unique_lock<std::mutex> & lk, ggml_tensor * t) {
     }
 
     disk_tensor & dt = it->second;
+    if (S.window_dbg && dt.state != ST_RESIDENT) {
+        fprintf(stderr, "llama-disk[win]: full load %s off=%zu size=%zu MiB state=%d\n",
+                ggml_get_name(t), dt.off, dt.size >> 20, (int) dt.state);
+    }
 
     if (dt.state != ST_RESIDENT) {
         if (dt.state == ST_LOADING) {
@@ -797,15 +821,138 @@ void unpin(ggml_tensor * t) {
     }
 }
 
+// prefill GET_ROWS: the ids of a whole ubatch are scattered over the vocab, so the span trick
+// would read almost the whole table. gather only the unique rows into a compact block, remap the
+// ids in place (restored when the window is finally released) and point the weight at the block.
+bool ensure_rows_compact(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
+    ggml_tensor * w  = node->src[0];
+    ggml_tensor * ix = node->src[1];
+    auto it = S.tensors.find(w);
+    if (it == S.tensors.end() || ix == nullptr || ix->data == nullptr || ix->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (S.windows.count(w) > 0) {
+        return false;
+    }
+
+    const int64_t n = ggml_nelements(ix);
+    const size_t  row_bytes = w->nb[1];
+    if (n < 1 || n > 512) {
+        return false;
+    }
+
+    const int32_t * ids = (const int32_t *) ix->data;
+    std::vector<int32_t> uniq;
+    uniq.reserve((size_t) n);
+    std::vector<int32_t> remap((size_t) n, -1);
+    for (int64_t i = 0; i < n; ++i) {
+        if (ids[i] < 0 || ids[i] >= w->ne[1]) {
+            return false;
+        }
+        int32_t slot = -1;
+        for (size_t j = 0; j < uniq.size(); ++j) {
+            if (uniq[j] == ids[i]) {
+                slot = (int32_t) j;
+                break;
+            }
+        }
+        if (slot < 0) {
+            slot = (int32_t) uniq.size();
+            uniq.push_back(ids[i]);
+        }
+        remap[(size_t) i] = slot;
+    }
+
+    const size_t total = uniq.size() * row_bytes;
+    if (total > S.arena_size / 2) {
+        return false;
+    }
+
+    const disk_tensor & wdt = it->second;
+
+    // claim + allocate a compact block (same policy as load_into: evict or wait for space)
+    S.windows[w] = -2;
+    size_t off = 0;
+    int    n_stuck = 0;
+    while (!take_range(total, &off)) {
+        if (evict_one()) {
+            continue;
+        }
+        S.n_wait++;
+        if (++n_stuck > 200) {
+            S.windows.erase(w);
+            S.cv_done.notify_all();
+            return false;
+        }
+        S.cv_done.wait(lk);
+    }
+
+    int64_t idx = -1;
+    for (size_t i = 0; i < S.slots.size(); ++i) {
+        if (S.slots[i].owner == nullptr) {
+            idx = (int64_t) i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        S.slots.emplace_back();
+        idx = (int64_t) S.slots.size() - 1;
+    }
+    {
+        arena_slot & sl = S.slots[idx];
+        sl.off   = off;
+        sl.size  = total;
+        sl.owner = w;
+        sl.pins  = 1;
+        sl.tick  = ++S.tick;
+    }
+
+    S.window_saved[w] = (uint8_t *) w->data;
+
+    // read the unique rows into the compact block (buffered reads: rows are scattered)
+    for (size_t j = 0; j < uniq.size(); ++j) {
+        if (!read_exact(wdt.fd_buf, S.arena + off + j * row_bytes, row_bytes,
+                        wdt.off + (size_t) uniq[j] * row_bytes)) {
+            free_range(off, total);
+            S.slots[idx].owner = nullptr;
+            S.window_saved.erase(w);
+            S.windows.erase(w);
+            S.cv_done.notify_all();
+            return false;
+        }
+    }
+
+    // remap the ids and point the weight at the compact block (row j == compact index j)
+    std::vector<int32_t> orig((size_t) n);
+    memcpy(orig.data(), ids, (size_t) n * sizeof(int32_t));
+    int32_t * ids_mut = (int32_t *) ix->data;
+    for (int64_t i = 0; i < n; ++i) {
+        ids_mut[i] = remap[(size_t) i];
+    }
+    state::window_restore rest;
+    rest.ids  = ix;
+    rest.orig = std::move(orig);
+    S.window_restore_map[w] = std::move(rest);
+
+    w->data = S.arena + off;
+    S.windows[w] = idx;
+    S.slots[idx].pins = 1;
+    S.cv_done.notify_all();
+    return true;
+}
+
 // a GET_ROWS node only reads a handful of rows out of a huge embedding table, load just those
 bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
     ggml_tensor * w  = node->src[0];
     ggml_tensor * ix = node->src[1];
 
     if (w == nullptr || ix == nullptr || ix->data == nullptr || ix->type != GGML_TYPE_I32) {
+        if (S.window_dbg) fprintf(stderr, "llama-disk[win]: rows skip: bad tensor/ids (%s)\n", ggml_get_name(w ? w : node->src[0]));
         return false;
     }
     if (w->ne[1] <= 1 || S.windows.count(w) > 0) {
+        if (S.window_dbg) fprintf(stderr, "llama-disk[win]: rows skip: window_exists=%d ne1=%lld\n",
+                                   (int) S.windows.count(w), (long long) w->ne[1]);
         return false;
     }
 
@@ -815,8 +962,11 @@ bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
     }
 
     const int64_t n = ggml_nelements(ix);
-    if (n < 1 || n > 8) {
+    if (n < 1) {
         return false;
+    }
+    if (n > 8) {
+        return ensure_rows_compact(lk, node);
     }
 
     const size_t row_bytes = w->nb[1];
@@ -834,10 +984,15 @@ bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
 
     const size_t span = (size_t) (rmax - rmin + 1) * row_bytes;
     if (span > S.arena_size / 2) {
-        return false;
+        if (S.window_dbg) fprintf(stderr, "llama-disk[win]: rows span %zu > arena/2, using compact gather\n", span);
+        return ensure_rows_compact(lk, node);
     }
 
     const disk_tensor & wdt = it->second;
+
+    // claim the window before load_into() releases the lock for the pread: another compute
+    // thread that asks for the same tensor while it is being installed waits below
+    S.windows[w] = -2;
 
     disk_tensor dt;
     dt.fd     = wdt.fd_buf; // a few rows, buffered is fine
@@ -846,16 +1001,32 @@ bool ensure_rows_window(std::unique_lock<std::mutex> & lk, ggml_tensor * node) {
     dt.size   = span;
     dt.fsize  = wdt.fsize;
 
+    uint8_t * saved = (uint8_t *) w->data;
+
     int64_t slot = -1;
     if (!load_into(lk, w, dt, true, false, &slot)) {
+        S.windows.erase(w);
+        S.cv_done.notify_all();
         return false;
     }
 
-    // rows of the table are contiguous, so the window can be shifted under the whole tensor
-    uint8_t * base = S.arena + S.slots[slot].off;
+    // remember the pointer we are about to overwrite: the parent may be fully resident as well
+    S.window_saved[w] = saved;
+
+    // rows of the table are contiguous, so the window can be shifted under the whole tensor.
+    // load_into() already put w->data at the first byte of the requested range (it includes the
+    // O_DIRECT alignment delta), so only step back by the rows that precede the first one.
+    uint8_t * base = (uint8_t *) w->data;
     w->data = base - (size_t) rmin * row_bytes;
 
-    S.windows.emplace(w, slot);
+    S.windows[w] = slot;
+    S.slots[slot].pins = 1; // pinned for this node, other threads pin when they find the window
+    S.cv_done.notify_all();
+
+    if (S.window_dbg) {
+        fprintf(stderr, "llama-disk[win]: rows window %s ids=%lld..%lld span=%zu slot=%lld\n",
+                ggml_get_name(w), (long long) rmin, (long long) rmax, span, (long long) slot);
+    }
 
     return true;
 }
@@ -877,9 +1048,29 @@ bool ensure_window(std::unique_lock<std::mutex> & lk, ggml_tensor * t, ggml_tens
 
     auto wit = S.windows.find(t);
     if (wit != S.windows.end()) {
-        S.slots[wit->second].pins++;
+        int64_t slot = wit->second;
+        if (slot == -2) {
+            // another compute thread is installing this window right now
+            while (true) {
+                auto it2 = S.windows.find(t);
+                if (it2 == S.windows.end()) {
+                    return false; // the installer failed
+                }
+                if (it2->second != -2) {
+                    slot = it2->second;
+                    break;
+                }
+                S.n_wait++;
+                S.cv_done.wait(lk);
+            }
+        }
+        S.slots[slot].pins++;
         return true;
     }
+
+    // claim before load_into() releases the lock for the pread
+    S.windows[t] = -2;
+    uint8_t * saved = (uint8_t *) t->data;
 
     disk_tensor dt;
     dt.fd     = pdt.fd;
@@ -890,13 +1081,58 @@ bool ensure_window(std::unique_lock<std::mutex> & lk, ggml_tensor * t, ggml_tens
 
     int64_t slot = -1;
     if (!load_into(lk, t, dt, true, false, &slot)) {
+        S.windows.erase(t);
+        S.cv_done.notify_all();
         return false;
     }
 
-    S.windows.emplace(t, slot);
-    S.slots[slot].pins++;
+    // remember the pointer we are about to overwrite (it may be a view into a resident parent)
+    S.window_saved[t] = saved;
+
+    S.windows[t] = slot;
+    S.slots[slot].pins = 1;
+    S.cv_done.notify_all();
 
     return true;
+}
+
+// free the windows whose pins reached zero, called with the lock held at the start of a node
+void drain_deferred_windows() {
+    if (S.windows_defer.empty()) {
+        return;
+    }
+    std::vector<ggml_tensor *> keep;
+    keep.reserve(S.windows_defer.size());
+    for (ggml_tensor * t : S.windows_defer) {
+        auto wit = S.windows.find(t);
+        if (wit == S.windows.end() || wit->second < 0) {
+            continue;
+        }
+        const int64_t slot = wit->second;
+        if (S.slots[slot].pins > 0) {
+            // somebody pinned it again after the last unpin
+            keep.push_back(t);
+            continue;
+        }
+        arena_slot & sl = S.slots[slot];
+        free_range(sl.off, sl.size);
+        sl.owner = nullptr;
+        auto sit = S.window_saved.find(t);
+        t->data = sit != S.window_saved.end() ? sit->second : S.placeholder;
+        if (sit != S.window_saved.end()) {
+            S.window_saved.erase(sit);
+        }
+        auto rit = S.window_restore_map.find(t);
+        if (rit != S.window_restore_map.end()) {
+            if (rit->second.ids != nullptr && !rit->second.orig.empty()) {
+                memcpy(rit->second.ids->data, rit->second.orig.data(),
+                       rit->second.orig.size() * sizeof(int32_t));
+            }
+            S.window_restore_map.erase(rit);
+        }
+        S.windows.erase(wit);
+    }
+    S.windows_defer.swap(keep);
 }
 
 void ensure_tree(std::unique_lock<std::mutex> & lk, ggml_tensor * t) {
@@ -905,14 +1141,35 @@ void ensure_tree(std::unique_lock<std::mutex> & lk, ggml_tensor * t) {
     }
     auto wit = S.windows.find(t);
     if (wit != S.windows.end()) {
-        S.slots[wit->second].pins++;
-        return;
+        while (wit != S.windows.end() && wit->second == -2) {
+            // another compute thread is installing this window right now
+            S.n_wait++;
+            S.cv_done.wait(lk);
+            wit = S.windows.find(t);
+        }
+        if (wit != S.windows.end()) {
+            if (S.slots[wit->second].owner != t) {
+                if (S.window_dbg) {
+                    fprintf(stderr, "llama-disk[win]: STALE window entry for %s (slot %lld owner %s)\n",
+                            ggml_get_name(t), (long long) wit->second,
+                            S.slots[wit->second].owner ? ggml_get_name(S.slots[wit->second].owner) : "(null)");
+                }
+                S.windows.erase(wit);
+            } else {
+                S.slots[wit->second].pins++;
+                return;
+            }
+        }
     }
     if (t->view_src != nullptr) {
-        if (S.window && S.tensors.count(t->view_src) > 0 && ggml_is_contiguous(t)) {
+        if (S.window && S.window_views && S.tensors.count(t->view_src) > 0 && ggml_is_contiguous(t)) {
             if (ensure_window(lk, t, t->view_src)) {
                 return;
             }
+        }
+        if (S.window_dbg) {
+            fprintf(stderr, "llama-disk[win]: view %s -> fallback parent %s\n",
+                    ggml_get_name(t), ggml_get_name(t->view_src));
         }
         ensure_tree(lk, t->view_src);
         t->data = (uint8_t *) t->view_src->data + t->view_offs;
@@ -928,15 +1185,27 @@ void unpin_tree(ggml_tensor * t) {
     auto wit = S.windows.find(t);
     if (wit != S.windows.end()) {
         arena_slot & sl = S.slots[wit->second];
+        if (S.window_dbg && sl.owner != t) {
+            fprintf(stderr, "llama-disk[win]: free %s but slot owner is %s\n",
+                    ggml_get_name(t), sl.owner ? ggml_get_name(sl.owner) : "(null)");
+        }
         if (sl.pins > 0) {
             sl.pins--;
         }
         if (sl.pins == 0) {
-            // the window was only needed by this node
-            free_range(sl.off, sl.size);
-            sl.owner = nullptr;
-            t->data  = S.placeholder;
-            S.windows.erase(wit);
+            // the window was only needed by this node. do not free it here: another compute
+            // thread may still be waiting for it (some ops run on thread 0 only), so the free
+            // is deferred to the start of the next node, after the node barrier
+            bool queued = false;
+            for (ggml_tensor * d : S.windows_defer) {
+                if (d == t) {
+                    queued = true;
+                    break;
+                }
+            }
+            if (!queued) {
+                S.windows_defer.push_back(t);
+            }
         }
         return;
     }
@@ -1340,9 +1609,12 @@ void node_cb(ggml_tensor * node, bool done) {
     std::unique_lock<std::mutex> lk(S.mtx);
 
     if (!done) {
+        drain_deferred_windows();
+        tls_cur_node = node;
         // a new node: forget the window this thread pinned for the previous one
         tls_moe_w    = nullptr;
         tls_moe_used = false;
+        tls_rows_w   = nullptr;
     }
 
     if (!done && S.fail) {
@@ -1379,8 +1651,12 @@ void node_cb(ggml_tensor * node, bool done) {
         }
     }
 
-    if (!done && S.window && node->op == GGML_OP_GET_ROWS) {
-        ensure_rows_window(lk, node);
+    if (!done && S.window && S.window_rows && node->op == GGML_OP_GET_ROWS) {
+        if (ensure_rows_window(lk, node)) {
+            // ensure_rows_window() already pinned the window for this node; remember it so
+            // the generic source loop below does not pin the same tensor a second time
+            tls_rows_w = node->src[0];
+        }
     }
 
     // MoE fast path: the expert weights come from a compact window instead of the whole
@@ -1409,8 +1685,16 @@ void node_cb(ggml_tensor * node, bool done) {
         }
 
         if (!done) {
+            if (src == tls_rows_w) {
+                continue;   // already pinned by ensure_rows_window()
+            }
             ensure_tree(lk, src);
         } else {
+            if (src == tls_rows_w) {
+                unpin_tree(src);
+                tls_rows_w = nullptr;
+                continue;
+            }
             unpin_tree(src);
         }
     }
@@ -1550,10 +1834,10 @@ bool moe_enabled() {
 }
 
 int out_chunk_rows() {
+    if (!enabled()) {
+        return 0;
+    }
     static const int rows = [] {
-        if (!enabled()) {
-            return 0;
-        }
         const char * env = getenv("LLAMA_DISK_OUT_CHUNK");
         if (env == nullptr) {
             return 0;
@@ -1561,7 +1845,63 @@ int out_chunk_rows() {
         const int n = atoi(env);
         return n > 0 ? n : 0;
     }();
-    return rows;
+    if (rows > 0) {
+        return rows;
+    }
+    return S.tiny ? S.auto_chunk_rows : 0;
+}
+
+bool tiny_arena_mode() {
+    return enabled() && S.tiny;
+}
+
+bool split_all_matmul() {
+    if (!enabled()) {
+        return false;
+    }
+    static const int env = [] {
+        const char * e = getenv("LLAMA_DISK_SPLIT_MM");
+        return e != nullptr ? atoi(e) : -1;
+    }();
+    if (env >= 0) {
+        return env == 1;
+    }
+    return S.tiny;
+}
+
+int matmul_chunk_rows(int64_t ne1, size_t row_bytes) {
+    if (!enabled() || row_bytes == 0 || ne1 <= 0) {
+        return 0;
+    }
+    static const int rows_env = [] {
+        const char * env = getenv("LLAMA_DISK_OUT_CHUNK");
+        if (env == nullptr) {
+            return 0;
+        }
+        const int n = atoi(env);
+        return n > 0 ? n : 0;
+    }();
+    if (rows_env > 0) {
+        return rows_env;
+    }
+    if (!S.tiny) {
+        return 0;
+    }
+    // one chunk ~1/4 of the arena, at least 256 rows, at most 64 chunks per tensor so the graph
+    // does not explode for large output layers
+    int64_t rows = (int64_t) (std::max<size_t>(S.arena_size / 4, 2u << 20) / row_bytes);
+    rows = std::max<int64_t>(rows, 256);
+    rows = std::max<int64_t>(rows, (ne1 + 63) / 64);
+    rows = std::min<int64_t>(rows, 16384);
+    return (int) rows;
+}
+
+int64_t split_threshold_bytes() {
+    if (!S.tiny) {
+        return 0;
+    }
+    // split a weight whose read would not leave room for the other tensors of the node
+    return (int64_t) (S.arena_size * 3 / 5);
 }
 
 void init() {
@@ -1594,7 +1934,12 @@ void init() {
     S.verbose = env_v != nullptr && atoi(env_v) == 1;
 
     const char * env_win = getenv("LLAMA_DISK_WINDOW");
-    S.window = env_win != nullptr && atoi(env_win) == 1;
+    const int    win_mode = env_win != nullptr ? atoi(env_win) : 0;
+    const char * env_wdbg = getenv("LLAMA_DISK_WINDOW_DEBUG");
+    S.window_dbg = env_wdbg != nullptr && atoi(env_wdbg) == 1;
+    S.window = win_mode > 0;
+    S.window_rows  = (win_mode == 1 || win_mode == 2);
+    S.window_views = (win_mode == 1 || win_mode == 3);
 
     const char * env_dbg = getenv("LLAMA_DISK_DEBUG");
     S.debug = env_dbg != nullptr && atoi(env_dbg) == 1;
@@ -1661,6 +2006,15 @@ static size_t meminfo_kb(const char * key) {
 #endif
 }
 
+// LLAMA_DISK_TINY_ARENA=0 disables the automatic tiny-arena mode, everything else keeps it on
+static bool tiny_arena_disabled() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_DISK_TINY_ARENA");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    return v;
+}
+
 // size and allocate the arena now that every tensor (and so the biggest one) is known
 static bool alloc_arena() {
     const size_t need = align_up(S.max_tensor) + (24u << 20);
@@ -1672,15 +2026,23 @@ static bool alloc_arena() {
         want = tot_kb > 0 ? (((tot_kb >> 10) / 8) << 20) : (256u << 20);
         why = "auto, 1/8 of ram";
     }
-    if (want < need) {
+    // only an explicit request goes below the largest tensor; the automatic 1/8-of-ram size
+    // keeps the old behaviour (raised to fit the largest tensor)
+    if (want < need && S.arena_req > 0 && !tiny_arena_disabled()) {
+        S.tiny = true;
+        dmsg("llama-disk: tiny arena mode: arena %zu MiB < largest tensor '%s' (%zu MiB), "
+             "big tensors will be read in chunks\n",
+                want >> 20, S.name_max.c_str(), S.max_tensor >> 20);
+    } else if (want < need) {
         dmsg("llama-disk: arena %zu MiB cannot hold the largest tensor '%s' (%zu MiB), raised to %zu MiB\n",
                 want >> 20, S.name_max.c_str(), S.max_tensor >> 20, need >> 20);
         want = need;
         why = "raised to fit the largest tensor";
     }
-    if (want < (128u << 20)) {
-        want = 128u << 20;
-        why = "128 MiB floor";
+    const size_t floor_mb = S.tiny ? 8u : 128u;
+    if (want < (floor_mb << 20)) {
+        want = floor_mb << 20;
+        why = S.tiny ? "8 MiB floor (tiny arena)" : "128 MiB floor";
     }
     if (want > (2048u << 20)) {
         want = 2048u << 20;
@@ -1812,6 +2174,7 @@ void register_tensor(ggml_tensor * t, int fd, size_t off, size_t nbytes) {
     t->data = S.placeholder;
 
     S.bytes_registered += nbytes;
+    S.max_row_bytes = std::max(S.max_row_bytes, (size_t) t->nb[1]);
     if (nbytes > S.max_tensor) {
         S.max_tensor = nbytes;
         S.name_max   = ggml_get_name(t);
@@ -1831,13 +2194,37 @@ void finish_register() {
         return;
     }
 
+    if (S.tiny) {
+        if (!S.window) {
+            // big tensors have to be read as rows/views: no single read may need a whole tensor
+            S.window       = true;
+            S.window_rows  = true;
+            S.window_views = true;
+        }
+        // keep one chunk around 1/5 of the arena (a chunk fits together with the other tensors
+        // of the node and the rows/experts windows that are pinned at the same time)
+        if (S.max_row_bytes > 0) {
+            int64_t rows = (int64_t) ((S.arena_size / 5) / S.max_row_bytes);
+            rows = std::max<int64_t>(256, std::min<int64_t>(rows, 16384));
+            S.auto_chunk_rows = (int) rows;
+        }
+        dmsg("llama-disk: tiny arena: chunked reads, %d rows per matmul chunk, windows on\n",
+                S.auto_chunk_rows);
+    }
+
     if (align_up(S.max_tensor + S.align_io) > S.arena_size) {
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "arena is %zu MiB but the largest tensor '%s' needs %zu MiB",
-                 S.arena_size >> 20, S.name_max.c_str(),
-                 align_up(S.max_tensor + S.align_io) >> 20);
-        throw std::runtime_error(msg);
+        if (S.tiny) {
+            dmsg("llama-disk: tiny-arena: largest tensor '%s' (%zu MiB) exceeds the arena, "
+                 "it must be read in chunks\n",
+                    S.name_max.c_str(), S.max_tensor >> 20);
+        } else {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "arena is %zu MiB but the largest tensor '%s' needs %zu MiB",
+                     S.arena_size >> 20, S.name_max.c_str(),
+                     align_up(S.max_tensor + S.align_io) >> 20);
+            throw std::runtime_error(msg);
+        }
     }
 
     if (S.prefetch) {
@@ -1923,6 +2310,9 @@ void cleanup() {
     S.fd_map.clear();
     S.tensors.clear();
     S.windows.clear();
+    S.window_saved.clear();
+    S.windows_defer.clear();
+    S.window_restore_map.clear();
     S.order.clear();
     S.slots.clear();
     S.free_blk.clear();
@@ -1992,6 +2382,8 @@ void get_stats(struct llama_disk_stats * out) {
     out->direct_io        = S.odirect  ? 1 : 0;
     out->mlock            = S.mlock    ? 1 : 0;
     out->prefetch         = S.prefetch ? 1 : 0;
+    out->tiny             = S.tiny ? 1 : 0;
+    out->chunk_rows       = S.tiny ? S.auto_chunk_rows : 0;
     out->moe              = S.moe      ? 1 : 0;
     out->moe_nodes        = S.n_moe_nodes;
     out->moe_experts      = S.n_moe_experts;

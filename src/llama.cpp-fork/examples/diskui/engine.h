@@ -67,6 +67,24 @@ struct live_state {
     unsigned long long moe_expert_bytes = 0;
 };
 
+// estimate of the RAM the next run will need, filled by engine::probe_memory().
+// base_rss/arena/model metadata are measured, kv/recurrent/compute are read from the
+// memory sizes llama.cpp reports while a throw-away context with the same parameters
+// is created (so they are exact for the current model + settings).
+struct mem_estimate {
+    bool               ok = false;
+    std::string        err;
+    unsigned long long base_rss  = 0;   // current process RSS after the model is loaded
+    unsigned long long model     = 0;   // model metadata / tokenizer (RSS delta at load)
+    unsigned long long arena     = 0;   // weight arena
+    unsigned long long kv        = 0;   // attention KV cache (n_ctx dependent)
+    unsigned long long recurrent = 0;   // linear/SSM state (context independent)
+    unsigned long long compute   = 0;   // graph compute buffer (n_ubatch dependent)
+    unsigned long long scratch   = 0;   // batch inputs + logits/output buffers
+    unsigned long long resident  = 0;   // base_rss + kv + recurrent
+    unsigned long long peak      = 0;   // resident + compute + scratch
+};
+
 struct gen_result {
     bool        ok = false;
     std::string error;
@@ -114,6 +132,17 @@ public:
     // requested disk arena size in MiB for the current model, 0 = auto
     int  requested_arena_mb() const;
 
+    // RAM estimate for the next run with these settings (requires a loaded model).
+    // kv/recurrent/compute come from llama.cpp's own size report of a temporary context,
+    // base_rss/model/arena are measured; the result is cached per parameter set.
+    mem_estimate probe_memory(int n_ctx, int n_ubatch);
+    unsigned long long model_ram() const;
+
+    // route llama.cpp's log (the TUI installs its callback here so that probe_memory()
+    // can capture the memory-size lines)
+    using llama_logger_t = void (*)(enum ggml_log_level, const char *, void *);
+    void set_llama_logger(llama_logger_t cb, void * ud);
+
     // false when the GGUF carries no chat template
     bool has_chat_template() const;
     // extra tokens a single turn chat template adds on top of the bare message,
@@ -155,6 +184,14 @@ private:
     std::atomic<int>    m_n_layer{ 0 };
     std::atomic<bool>   m_moe_loaded{ false };
     int                 m_arena_mb = 0;          // requested arena, 0 = auto
+    unsigned long long  m_model_ram = 0;         // RSS delta of llama_model_load_from_file()
+    unsigned long long  m_base_rss  = 0;         // process RSS right after the model load
+    mem_estimate        m_mem_cache;
+    int                 m_mem_cache_ctx  = -1;
+    int                 m_mem_cache_ub   = -1;
+    const void *        m_mem_cache_model = nullptr;
+    llama_logger_t      m_llama_logger = nullptr;
+    void *              m_llama_logger_ud = nullptr;
     std::string         m_env_stream_orig;       // launcher value to restore for auto
     bool                m_env_stream_orig_set = false;
 

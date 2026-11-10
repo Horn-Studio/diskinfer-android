@@ -852,6 +852,7 @@ struct cli_options {
     float top_p      = 0.95f;
     int   port       = 4000;
     bool  help       = false;
+    bool  mem_probe  = false;   // --mem-probe: print the RAM estimate and exit
 };
 
 struct gen_job {
@@ -904,6 +905,10 @@ struct ui_state {
     std::string        status;
     bool               status_error = false;
     bool               have_run = false;
+
+    // cached RAM estimate for the settings/run pages (key = ctx|ubatch|arena|loaded)
+    diskui::mem_estimate mem_est;
+    std::string          mem_key;
 };
 
 ui_state       g_ui;
@@ -1073,23 +1078,25 @@ std::vector<row> frame_settings() {
 
     const std::string arena_value = g_ui.arena_mb > 0 ? std::to_string(g_ui.arena_mb)
                                                       : i18n::tr("common.auto");
-    const std::string values[6] = {
+    const std::string values[7] = {
         std::to_string(g_ui.n_ctx),
         v_temp,
         on_off(g_ui.chat),
         on_off(g_ui.moe),
         arena_value,
+        std::to_string(g_cli.n_ubatch),
         on_off(g_ui.api_on),
     };
-    const std::string labels[6] = {
+    const std::string labels[7] = {
         i18n::tr("set.context"),
         i18n::tr("set.temperature"),
         i18n::tr("set.chat_template"),
         i18n::tr("set.moe_path"),
         i18n::tr("set.arena"),
+        i18n::tr("set.prefill"),
         i18n::tr("set.api_server"),
     };
-    const std::string hints[6] = {
+    const std::string hints[7] = {
         i18n::trf("set.ctx_hint_fmt", g_ui.ctx_max),
         i18n::tr("set.temp_hint"),
         (g_ui.tmpl_extra >= 0)
@@ -1097,10 +1104,11 @@ std::vector<row> frame_settings() {
             : i18n::tr("set.chat_hint_unknown"),
         i18n::tr("set.moe_hint"),
         i18n::tr("set.arena_hint"),
+        i18n::tr("set.prefill_hint"),
         i18n::trf("set.api_hint_fmt", g_cli.port),
     };
 
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 7; ++i) {
         const bool sel = (g_ui.sel == i);
         std::string s = "  ";
         s += sel ? "▸ " : "  ";
@@ -1143,6 +1151,36 @@ std::vector<row> frame_settings() {
                              : i18n::trf("set.system_prompt_fmt", g_ui.sysmsg.c_str()),
                          g_cols - 4),
              S_DIM);
+    }
+
+    // RAM estimate of the next run with the current settings -----------------
+    {
+        diskui::engine & engr = diskui::engine::get();
+        const std::string mem_key = std::to_string(g_ui.n_ctx) + "|" +
+                                    std::to_string(g_cli.n_ubatch) + "|" +
+                                    std::to_string(g_ui.arena_mb) + "|" +
+                                    (engr.loaded() ? "1" : "0");
+        if (mem_key != g_ui.mem_key) {
+            g_ui.mem_key = mem_key;
+            if (engr.loaded() && !engr.busy()) {
+                g_ui.mem_est = engr.probe_memory(g_ui.n_ctx, g_cli.n_ubatch);
+            } else {
+                g_ui.mem_est = diskui::mem_estimate();
+            }
+        }
+        if (g_ui.mem_est.ok) {
+            push("  " + i18n::trf("set.ram_resident_fmt",
+                                  diskui::human_bytes(g_ui.mem_est.resident).c_str(),
+                                  diskui::human_bytes(g_ui.mem_est.kv).c_str(),
+                                  diskui::human_bytes(g_ui.mem_est.recurrent).c_str(),
+                                  diskui::human_bytes(g_ui.mem_est.arena).c_str()), S_DIM);
+            push("  " + i18n::trf("set.ram_peak_fmt",
+                                  diskui::human_bytes(g_ui.mem_est.peak).c_str(),
+                                  diskui::human_bytes(g_ui.mem_est.compute).c_str(),
+                                  diskui::human_bytes(g_ui.mem_est.scratch).c_str()), S_DIM);
+        } else {
+            push(std::string("  ") + i18n::tr("set.ram_note"), S_DIM);
+        }
     }
 
     // footer ---------------------------------------------------------------
@@ -1368,10 +1406,30 @@ std::vector<row> frame_run() {
         info.push_back(i18n::trf("run.info_path_fmt", clip(g_ui.model_path, g_cols - 12).c_str()));
         info.push_back(i18n::trf("run.info_size_fmt",
                                  diskui::human_bytes(ds.registered_bytes).c_str(), ds.tensors));
-        info.push_back(i18n::trf("run.info_arena_fmt",
-                                 diskui::human_bytes(ds.arena_bytes).c_str(),
-                                 ds.direct_io ? i18n::tr("common.on") : i18n::tr("common.off"),
-                                 ds.mlock ? i18n::tr("common.on") : i18n::tr("common.off")));
+        if (ds.tiny) {
+            info.push_back(i18n::trf("run.info_arena_tiny_fmt",
+                                     diskui::human_bytes(ds.arena_bytes).c_str(),
+                                     std::to_string(ds.chunk_rows).c_str(),
+                                     ds.direct_io ? i18n::tr("common.on") : i18n::tr("common.off")));
+        } else {
+            info.push_back(i18n::trf("run.info_arena_fmt",
+                                     diskui::human_bytes(ds.arena_bytes).c_str(),
+                                     ds.direct_io ? i18n::tr("common.on") : i18n::tr("common.off"),
+                                     ds.mlock ? i18n::tr("common.on") : i18n::tr("common.off")));
+        }
+        {
+            diskui::engine & engr = diskui::engine::get();
+            if (!engr.busy()) {
+                g_ui.mem_est = engr.probe_memory(g_ui.n_ctx, g_cli.n_ubatch);
+                g_ui.mem_key.clear();
+            }
+            if (g_ui.mem_est.ok) {
+                info.push_back(i18n::trf("run.info_ram_fmt",
+                                         diskui::human_bytes(g_ui.mem_est.resident).c_str(),
+                                         diskui::human_bytes(g_ui.mem_est.peak).c_str(),
+                                         diskui::human_bytes(g_ui.mem_est.kv + g_ui.mem_est.recurrent).c_str()));
+            }
+        }
         info.push_back(i18n::trf("run.info_context_fmt", g_ui.n_ctx, g_ui.ctx_max,
                                  tmpl_note.c_str()));
         info.push_back(i18n::trf("run.info_runtime_fmt", g_cli.n_threads, g_cli.n_ubatch,
@@ -1775,12 +1833,12 @@ bool handle_settings(int key) {
         return false;
     }
     if (key == K_UP) {
-        g_ui.sel = (g_ui.sel + 5) % 6;
+        g_ui.sel = (g_ui.sel + 6) % 7;
         invalidate();
         return true;
     }
     if (key == K_DOWN) {
-        g_ui.sel = (g_ui.sel + 1) % 6;
+        g_ui.sel = (g_ui.sel + 1) % 7;
         invalidate();
         return true;
     }
@@ -1836,15 +1894,22 @@ bool handle_settings(int key) {
     if (g_ui.sel == 4) {
         // disk arena size in MiB; 0 = auto (keep the launcher / LLAMA_DISK_STREAM_MB value)
         if (left || right) {
+            // 8..2048 MB; below 128 MB the steps halve (128, 64, 32, 16, 8, auto) so the
+            // tiny-arena mode (big tensors read in chunks) is reachable from the keyboard
             if (g_ui.arena_mb <= 0) {
                 g_ui.arena_mb = right ? 512 : 2048;
             } else if (right) {
-                g_ui.arena_mb = g_ui.arena_mb >= 2048 ? 2048 : g_ui.arena_mb + 128;
-            } else {
-                g_ui.arena_mb = g_ui.arena_mb - 128;
                 if (g_ui.arena_mb < 128) {
-                    g_ui.arena_mb = 0;   // stepping left from 128 goes back to auto
+                    g_ui.arena_mb = std::min(128, g_ui.arena_mb * 2);
+                } else {
+                    g_ui.arena_mb = std::min(2048, g_ui.arena_mb + 128);
                 }
+            } else if (g_ui.arena_mb > 128) {
+                g_ui.arena_mb -= 128;
+            } else if (g_ui.arena_mb <= 8) {
+                g_ui.arena_mb = 0;   // stepping left from 8 MB goes back to auto
+            } else {
+                g_ui.arena_mb /= 2;
             }
             return true;
         }
@@ -1860,11 +1925,40 @@ bool handle_settings(int key) {
                 a_typed = a_typed * 10 + (key - '0');
             }
             a_at = now;
-            g_ui.arena_mb = (a_typed == 0) ? 0 : std::max(128, std::min(2048, a_typed));
+            g_ui.arena_mb = (a_typed == 0) ? 0 : std::max(8, std::min(2048, a_typed));
             return true;
         }
     }
-    if (g_ui.sel == 5 && enter) {
+    if (g_ui.sel == 5) {
+        // tokens per prefill batch: 1..256. bigger batches mean fewer graph launches and a
+        // faster prefill, but they also raise the peak RAM (context + compute buffer)
+        if (left || right) {
+            int step = 1;
+            if (g_cli.n_ubatch >= 64) {
+                step = 16;
+            } else if (g_cli.n_ubatch >= 8) {
+                step = 4;
+            }
+            g_cli.n_ubatch = std::max(1, std::min(256, g_cli.n_ubatch + (right ? step : -step)));
+            return true;
+        }
+        if (key >= '0' && key <= '9') {
+            static int     b_typed = -1;
+            static int64_t b_at    = 0;
+            const int64_t now = (int64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (b_typed < 0 || now - b_at > 1500) {
+                b_typed = 0;
+            }
+            if (b_typed < 10000) {
+                b_typed = b_typed * 10 + (key - '0');
+            }
+            b_at = now;
+            g_cli.n_ubatch = (b_typed == 0) ? 1 : std::max(1, std::min(256, b_typed));
+            return true;
+        }
+    }
+    if (g_ui.sel == 6 && enter) {
         set_api_enabled(!g_ui.api_on);
         return true;
     }
@@ -1961,7 +2055,7 @@ int run_tui() {
     // the terminal is only ours after term_enter(); everything below assumes it
     install_signal_handlers();
     eng.set_log_sink(route_log);
-    llama_log_set(llama_log_cb, nullptr);
+    diskui::engine::get().set_llama_logger(llama_log_cb, nullptr);
     llama_disk::set_msg_cb(disk_msg_cb);
 
     term_enter();
@@ -2060,7 +2154,7 @@ int run_tui() {
     g_api.stop();
     g_ui.api_on = false;
 
-    llama_log_set(nullptr, nullptr);
+    diskui::engine::get().set_llama_logger(nullptr, nullptr);
     llama_disk::set_msg_cb(nullptr);
     eng.unload();
 
@@ -2090,7 +2184,7 @@ int run_api_only() {
     });
     // same filter as the TUI: keep errors and the disk engine status, drop the
     // loader / graph dump chatter
-    llama_log_set(llama_log_cb, nullptr);
+    diskui::engine::get().set_llama_logger(llama_log_cb, nullptr);
 
     auto say = [](const std::string & s) {
         fputs(s.c_str(), stdout);
@@ -2229,6 +2323,8 @@ bool parse_args(int argc, char ** argv) {
                 setenv("LLAMA_DISK_STREAM_MB", buf, 1);
 #endif
             }
+        } else if (a == "--mem-probe") {
+            g_cli.mem_probe = true;
         } else if (a == "--debug") {
 #if defined(_WIN32)
             _putenv_s("LLAMA_DISK_DEBUG", "1");
@@ -2260,6 +2356,37 @@ int run_cli_fallback() {
     // pipe, explain what to do instead and exit with a distinct code
     fputs(i18n::tr("misc.no_tty"), stderr);
     return 2;
+}
+
+// --mem-probe: load the model, create a throw-away context with the requested n_ctx /
+// prefill batch, report the RAM the next run will need (used by CI / documentation and
+// for checking the estimate on a new device without running a full inference)
+int run_mem_probe() {
+    if (g_cli.model.empty()) {
+        fputs("mem-probe: -m PATH is required\n", stderr);
+        return 1;
+    }
+    diskui::engine & eng = diskui::engine::get();
+    eng.set_log_sink([](const std::string & s) { fprintf(stderr, "%s\n", s.c_str()); });
+
+    std::string err;
+    if (!eng.load(g_cli.model, g_cli.moe, err, 0)) {
+        fprintf(stderr, "mem-probe: load failed: %s\n", err.c_str());
+        return 1;
+    }
+    const diskui::mem_estimate e = eng.probe_memory(g_cli.n_ctx, g_cli.n_ubatch);
+    if (!e.ok) {
+        fprintf(stderr, "mem-probe: %s\n", e.err.c_str());
+        return 1;
+    }
+    auto mib = [](unsigned long long b) { return (double) b / 1024.0 / 1024.0; };
+    printf("mem-probe model=%s ctx=%d ubatch=%d\n", g_cli.model.c_str(), g_cli.n_ctx, g_cli.n_ubatch);
+    printf("mem-probe arena=%.1fMiB model_meta=%.1fMiB kv=%.1fMiB recurrent=%.1fMiB "
+           "compute=%.1fMiB scratch=%.1fMiB\n",
+           mib(e.arena), mib(e.model), mib(e.kv), mib(e.recurrent), mib(e.compute), mib(e.scratch));
+    printf("mem-probe base_rss=%.1fMiB resident=%.1fMiB peak=%.1fMiB\n",
+           mib(e.base_rss), mib(e.resident), mib(e.peak));
+    return 0;
 }
 
 } // namespace
@@ -2304,6 +2431,10 @@ int main(int argc, char ** argv) {
     }
     if (g_cli.temp > 1.0f) {
         g_cli.temp = 1.0f;
+    }
+
+    if (g_cli.mem_probe) {
+        return run_mem_probe();
     }
 
     if (g_cli.api_only) {
