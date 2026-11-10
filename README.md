@@ -3,11 +3,11 @@
 在 Android（Termux / adb shell）上运行远大于可用内存的 GGUF 模型：权重留在硬盘，按计算图节点流式读进一块很小的内存 arena，用完 LRU 换出。
 项目背景、原理与历史版本说明见 **[readme_old.md](readme_old.md)**。
 
-> 本版仍然是 **1.0.1**。下面的数字除了标注"待测"的，都是本轮在 Android x86_64 模拟器（MuMu，Android 12，8GB RAM，模型在 /data/local/tmp 本地盘）上实测得到的。
+> 版本：**diskinfer 1.0.1**。下面的数字除了标注"待测"的，都是在 Android x86_64 模拟器（MuMu，Android 12，8GB RAM，模型在 /data/local/tmp 本地盘）上实测得到的。
 
 ## 1.0.1 更新内容
 
-### 极限小 arena（本轮重点）
+### 极限小 arena
 
 - **arena 小于最大张量时自动进入 tiny 模式**：`token_embd.weight` 输入只读被选中的行（prefill 用 compact 行 gather，不再整表读）；`output.weight` / tied `token_embd.weight` 的输出矩阵按行分块；其它放不下的大矩阵（ffn/attn）也可按行分块。**arena 下限 8 MiB**。
 - 实测 arena 下限：Qwen3.5-0.8B-MoE 从 222 MiB → **8 MiB**；Bonsai2 27B 从 365 MiB → **16 MiB**，输出与 2048 MiB arena 逐 token 一致（见下表）。

@@ -1,6 +1,6 @@
 ## diskinfer Android 1.0.1
 
-### 本轮更新（仍然打包为 1.0.1）
+### 更新内容
 
 **极限小 arena：把大张量继续拆小**
 - arena 小于最大张量时自动进入 tiny 模式：`token_embd` 输入只读被选中的行（prefill 用 compact 行 gather），输出层（含 tied `token_embd.weight`）按行分块，其它放不下的大矩阵（ffn/attn）按行分块。
