@@ -1,8 +1,8 @@
-# diskinfer-android - 在 Android（Termux / adb shell）上运行远大于可用内存的 GGUF 模型：权重留在硬盘，按计算图节点流式读进一块很小的内存 arena，用完 LRU 换出。
-
+# diskinfer-android - 在 Android（Termux / adb shell）上运行远大于可用内存的 GGUF 模型
+权重留在硬盘，按计算图节点流式读进一块很小的内存 arena，用完 LRU 换出。
 项目背景、原理与历史版本说明见 **[readme_old.md](readme_old.md)**。
 
-> 版本：**diskinfer 1.0.1**。下面的数字除了标注"待测"的，都是在 Android x86_64 模拟器（MuMu，Android 12，8GB RAM，模型在 /data/local/tmp 本地盘）上实测得到的。
+> 版本：**diskinfer 1.0.1** ，跟进llama.cpp上游，MoE模型初步支持，arena继续压缩，API接入，新UI……详情请见release
 
 ## 1.0.1 更新内容
 
@@ -65,7 +65,6 @@
 
 - `常驻 = 进程基础 RSS + KV + 递归状态 + min(arena, 模型大小)`；`峰值 = 常驻 + 计算缓冲 + 批输入/输出缓冲`。
 - 计算缓冲随 Prefill 批量增长（tiny 分块模式下尤其明显），设置页会实时显示，请按设备内存选择。
-- **手机真机待测。**
 
 ## 快速开始
 
@@ -136,11 +135,6 @@ curl http://127.0.0.1:4000/v1/chat/completions -H 'Content-Type: application/jso
 - armv7（32 位）无法寻址 ≥ 4 GiB 的 GGUF。
 - 桌面平台 native 默认启用 repack，与流式对照时 token 可能不同（浮点累加顺序，不是 bug）；Android 目标构建为 baseline。
 
-## 待测
-
-- arm64-v8a / armeabi-v7a 真机的 tiny arena 速度与 buffered IO 收益。
-- 27B 模型在 ≥ 12 GB RAM 手机上的 buffered IO 效果。
-- 不同厂商闪存（UFS 2.x/3.x、eMMC）下的 decode 速度与寿命影响。
 
 ## 卸载
 
