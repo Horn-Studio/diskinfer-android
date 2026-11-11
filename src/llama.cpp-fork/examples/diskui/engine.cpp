@@ -28,7 +28,14 @@
 #include <stdexcept>
 #include <thread>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#else
 #include <sys/stat.h>
 #endif
 
@@ -39,6 +46,10 @@ namespace {
 // resident set size of this process right now (0 when the platform has no /proc)
 unsigned long long rss_bytes() {
 #if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return (unsigned long long) pmc.WorkingSetSize;
+    }
     return 0;
 #else
     FILE * f = fopen("/proc/self/status", "r");
@@ -61,6 +72,11 @@ unsigned long long rss_bytes() {
 // MemAvailable in bytes (0 when unknown)
 unsigned long long mem_available_bytes() {
 #if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        return (unsigned long long) ms.ullAvailPhys;
+    }
     return 0;
 #else
     FILE * f = fopen("/proc/meminfo", "r");
@@ -82,8 +98,18 @@ unsigned long long mem_available_bytes() {
 
 unsigned long long file_bytes(const std::string & path) {
 #if defined(_WIN32)
-    (void) path;
-    return 0;
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    LARGE_INTEGER sz;
+    unsigned long long out = 0;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0) {
+        out = (unsigned long long) sz.QuadPart;
+    }
+    CloseHandle(h);
+    return out;
 #else
     struct stat st;
     if (stat(path.c_str(), &st) != 0 || st.st_size < 0) {
@@ -432,6 +458,13 @@ bool engine::load(const std::string & path, bool moe, std::string & err, int are
     llama_disk::llama_disk_stats s;
     llama_disk::get_stats(&s);
 
+    // on some platforms (windows) the arena is committed during the load, so the RSS delta
+    // already contains it; strip it from the model-metadata figure in that case. on
+    // linux/android the arena pages are lazy, so the delta is the metadata/tokenizer size
+    if (s.arena_bytes > 0 && m_model_ram > s.arena_bytes + (8ull << 20)) {
+        m_model_ram -= s.arena_bytes;
+    }
+
     char desc[512] = { 0 };
     llama_model_desc(model, desc, sizeof(desc));
     log(i18n::trf("eng.ready_fmt", fmt_seconds((now_us() - t0) / 1e6).c_str(), desc));
@@ -605,7 +638,7 @@ mem_estimate engine::probe_memory(int n_ctx, int n_ubatch) {
     const unsigned long long arena_used = ds.registered_bytes > 0
         ? std::min<unsigned long long>(ds.arena_bytes, ds.registered_bytes)
         : ds.arena_bytes;
-    e.resident = e.base_rss + e.kv + e.recurrent + arena_used;
+    e.resident = e.model + e.kv + e.recurrent + arena_used;
     e.peak     = e.resident + e.compute + e.scratch;
 
     e.ok = true;
