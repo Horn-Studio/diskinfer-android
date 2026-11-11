@@ -1,6 +1,5 @@
-# diskinfer Android（1.0.1）
+# diskinfer-android - 在 Android（Termux / adb shell）上运行远大于可用内存的 GGUF 模型：权重留在硬盘，按计算图节点流式读进一块很小的内存 arena，用完 LRU 换出。
 
-在 Android（Termux / adb shell）上运行远大于可用内存的 GGUF 模型：权重留在硬盘，按计算图节点流式读进一块很小的内存 arena，用完 LRU 换出。
 项目背景、原理与历史版本说明见 **[readme_old.md](readme_old.md)**。
 
 > 版本：**diskinfer 1.0.1**。下面的数字除了标注"待测"的，都是在 Android x86_64 模拟器（MuMu，Android 12，8GB RAM，模型在 /data/local/tmp 本地盘）上实测得到的。
